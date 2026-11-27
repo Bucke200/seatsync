@@ -2,7 +2,7 @@ import { describe, expect, it } from "@jest/globals";
 import { loadConfig } from "../src/config";
 
 const REQUIRED_ENV = {
-  DATABASE_URL: "postgres://seatsync:seatsync@localhost:5434/seatsync",
+  DATABASE_URL: process.env.DATABASE_URL ?? "postgres://seatsync:seatsync@localhost:5434/seatsync",
   REDIS_URL: "redis://localhost:6379",
   JWT_SECRET: "test-jwt-secret",
   PAYMENT_WEBHOOK_SECRET: "test-webhook-secret",
@@ -23,6 +23,7 @@ describe("loadConfig", () => {
   it("throws naming every required variable when the environment is empty", () => {
     const message = configErrorMessage({});
 
+    expect(message).toContain("Missing required environment variable(s)");
     for (const variable of Object.keys(REQUIRED_ENV)) {
       expect(message).toContain(variable);
     }
