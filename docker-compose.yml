@@ -1,0 +1,89 @@
+name: seatsync
+
+# Compose reads the repo-root `.env` for ${...} interpolation. The api service
+# also gets that file via `env_file`, but its explicit `environment` block
+# overrides DATABASE_URL/REDIS_URL with service hostnames so the container never
+# receives the host-only localhost:5433 / localhost:6379 URLs. Compose gives
+# `environment` precedence over `env_file`.
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-seatsync}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-seatsync}
+      POSTGRES_DB: ${POSTGRES_DB:-seatsync}
+    ports:
+      # The host already runs unrelated Postgres instances on 5432 and 5433
+      # (aegis_postgres), so SeatSync's container is published on 5434 instead.
+      - "5434:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U \"$$POSTGRES_USER\" -d \"$$POSTGRES_DB\""]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 5s
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+    restart: unless-stopped
+
+  api:
+    build:
+      context: .
+      dockerfile: apps/api/Dockerfile
+    env_file:
+      - .env
+    environment:
+      NODE_ENV: production
+      # In-network addresses, deliberately different from the host values in .env.
+      DATABASE_URL: postgres://${POSTGRES_USER:-seatsync}:${POSTGRES_PASSWORD:-seatsync}@db:5432/${POSTGRES_DB:-seatsync}
+      REDIS_URL: redis://redis:6379
+    ports:
+      - "4000:4000"
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    # Every boot brings the schema up to date before the server starts.
+    command:
+      - sh
+      - -c
+      - node node_modules/node-pg-migrate/bin/node-pg-migrate.js -m migrations -d DATABASE_URL up && node --import tsx src/server.ts
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "node",
+          "-e",
+          "fetch('http://127.0.0.1:4000/health').then((r) => process.exit(r.status === 200 ? 0 : 1)).catch(() => process.exit(1))",
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
+    restart: unless-stopped
+
+  web:
+    build:
+      context: .
+      dockerfile: apps/web/Dockerfile
+    ports:
+      - "3000:3000"
+    depends_on:
+      api:
+        condition: service_healthy
+    restart: unless-stopped
+
+volumes:
+  pgdata:
