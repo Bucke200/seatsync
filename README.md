@@ -21,6 +21,8 @@ pnpm --filter api migrate up
 
 ## Standard commands
 
+From the repository root:
+
 ```bash
 pnpm install
 docker compose up -d db redis
@@ -28,6 +30,8 @@ pnpm --filter api migrate up
 pnpm lint && pnpm typecheck && pnpm test
 pnpm --filter api test -- <file-pattern>
 ```
+
+Lines joined with `&&` (including the quality gate below) need PowerShell 7+, `cmd`, or Git Bash; on Windows PowerShell 5.1, run each command on its own line.
 
 For example, `pnpm --filter api test -- health` runs only `apps/api/test/health.test.ts`.
 
