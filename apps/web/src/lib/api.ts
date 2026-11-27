@@ -3,13 +3,16 @@ import {
   ErrorResponseSchema,
   EventDetailSchema,
   EventSummarySchema,
+  HoldResponseSchema,
   PaginatedEventsResponseSchema,
 } from "@seatsync/shared";
 import type {
   AuthResponse,
   CreateEventRequest,
+  ErrorResponse,
   EventDetail,
   EventSummary,
+  HoldResponse,
   LoginRequest,
   PaginatedEventsResponse,
   SignupRequest,
@@ -23,6 +26,8 @@ export class ApiClientError extends Error {
     public readonly status: number,
     public readonly code: string,
     message: string,
+    /** The parsed `{ error: { ... } }` envelope, when the API sent one. */
+    public readonly body?: ErrorResponse,
   ) {
     super(message);
     this.name = "ApiClientError";
@@ -58,8 +63,10 @@ interface ResponseParser<T> {
 }
 
 interface RequestJsonOptions {
-  method?: "GET" | "POST";
+  method?: "GET" | "POST" | "DELETE";
   body?: unknown;
+  /** Extra headers merged over the defaults; the auth header still wins. */
+  headers?: Record<string, string>;
   /** Attach the stored Bearer token and clear it if the API answers 401. */
   auth?: boolean;
 }
@@ -75,6 +82,7 @@ function parseResponse<T>(schema: ResponseParser<T>, payload: unknown): T {
 async function toApiError(response: Response): Promise<ApiClientError> {
   let code = "REQUEST_FAILED";
   let message = `Request failed with status ${response.status}`;
+  let body: ErrorResponse | undefined;
 
   try {
     const payload: unknown = await response.json();
@@ -83,16 +91,20 @@ async function toApiError(response: Response): Promise<ApiClientError> {
     if (parsed.success) {
       code = parsed.data.error.code;
       message = parsed.data.error.message;
+      body = parsed.data;
     }
   } catch {
     // A non-JSON error body keeps the generic message.
   }
 
-  return new ApiClientError(response.status, code, message);
+  return new ApiClientError(response.status, code, message, body);
 }
 
 async function requestJson(path: string, options: RequestJsonOptions = {}): Promise<unknown> {
-  const headers: Record<string, string> = { Accept: "application/json" };
+  const headers: Record<string, string> = {
+    Accept: "application/json",
+    ...options.headers,
+  };
 
   if (options.body !== undefined) {
     headers["Content-Type"] = "application/json";
@@ -119,6 +131,10 @@ async function requestJson(path: string, options: RequestJsonOptions = {}): Prom
     }
 
     throw await toApiError(response);
+  }
+
+  if (response.status === 204) {
+    return null;
   }
 
   return response.json();
@@ -174,4 +190,41 @@ export async function publishEvent(id: string): Promise<EventSummary> {
   });
 
   return parseResponse(EventSummarySchema, payload);
+}
+
+/**
+ * Both hold outcomes are returned as data: a 201 needs `heldUntil` for the
+ * countdown and a 409 needs `details.seatIds` for the "seats taken" banner.
+ * Every other non-2xx status still throws `ApiClientError`.
+ */
+export type CreateHoldResult =
+  | { status: 201; body: HoldResponse }
+  | { status: 409; body: ErrorResponse };
+
+/** D2: the caller generates a fresh Idempotency-Key per hold attempt. */
+export async function createHold(
+  eventId: string,
+  seatIds: string[],
+  idempotencyKey: string,
+): Promise<CreateHoldResult> {
+  try {
+    const payload = await requestJson(`/api/events/${encodeURIComponent(eventId)}/holds`, {
+      method: "POST",
+      body: { seatIds },
+      auth: true,
+      headers: { "Idempotency-Key": idempotencyKey },
+    });
+
+    return { status: 201, body: parseResponse(HoldResponseSchema, payload) };
+  } catch (error) {
+    if (error instanceof ApiClientError && error.status === 409 && error.body !== undefined) {
+      return { status: 409, body: error.body };
+    }
+
+    throw error;
+  }
+}
+
+export async function releaseHold(holdId: string): Promise<void> {
+  await requestJson(`/api/holds/${encodeURIComponent(holdId)}`, { method: "DELETE", auth: true });
 }
