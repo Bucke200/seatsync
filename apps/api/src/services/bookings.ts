@@ -1,6 +1,17 @@
+import type {
+  BookingDetail,
+  MeBookingsItem,
+  MeBookingsResponse,
+} from "@seatsync/shared";
 import type { Pool } from "pg";
 import type { Config } from "../config";
-import { createCheckoutForHold } from "../db/bookings";
+import {
+  createCheckoutForHold,
+  getBookingDetail as getBookingDetailRecord,
+  listUserBookings,
+  type BookingDetailRecord,
+  type UserBookingRecord,
+} from "../db/bookings";
 import { ApiError } from "../middleware/errors";
 import { createPaymentProvider } from "../payments";
 
@@ -51,4 +62,64 @@ export async function checkoutHold(
       checkoutUrl: result.checkoutUrl,
     },
   };
+}
+
+function toBookingDetail(record: BookingDetailRecord): BookingDetail {
+  return {
+    id: record.id,
+    eventId: record.eventId,
+    status: record.status,
+    amountPaise: record.amountPaise,
+    paymentRef: record.paymentRef,
+    checkoutUrl: record.checkoutUrl,
+    holdId: record.holdId,
+    createdAt: record.createdAt.toISOString(),
+    seats: record.seats,
+  };
+}
+
+function toMeBookingsItem(record: UserBookingRecord): MeBookingsItem {
+  return {
+    id: record.id,
+    eventId: record.eventId,
+    eventTitle: record.eventTitle,
+    eventStartsAt: record.eventStartsAt.toISOString(),
+    status: record.status,
+    amountPaise: record.amountPaise,
+    seatCount: record.seatCount,
+    createdAt: record.createdAt.toISOString(),
+  };
+}
+
+/**
+ * D25 `GET /bookings/:id`. Missing bookings are 404; a booking that belongs to
+ * someone else is 403. The db row query computes ownership from the same row,
+ * so the two cases cannot collapse into one empty result.
+ */
+export async function getBookingDetail(
+  pool: Pool,
+  bookingId: string,
+  userId: string,
+): Promise<BookingDetail> {
+  const record = await getBookingDetailRecord(pool, { bookingId, userId });
+
+  if (record === null) {
+    throw new ApiError(404, "BOOKING_NOT_FOUND", "Booking not found");
+  }
+
+  if (!record.owned) {
+    throw new ApiError(403, "FORBIDDEN", "You do not own this booking");
+  }
+
+  return toBookingDetail(record);
+}
+
+/** D25 `GET /me/bookings`: the caller's bookings, newest first. */
+export async function listMyBookings(
+  pool: Pool,
+  userId: string,
+): Promise<MeBookingsResponse> {
+  const records = await listUserBookings(pool, userId);
+
+  return { bookings: records.map(toMeBookingsItem) };
 }

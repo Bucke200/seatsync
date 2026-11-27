@@ -42,10 +42,15 @@ interface RefundableBookingRow extends QueryResultRow {
 /**
  * Refund every FAILED booking that still carries a payment reference.
  *
- * Exactly-once discipline: the row lock + the `status = 'FAILED'` predicate
- * make the transition FAILED -> REFUNDED happen at most once per booking; the
- * `booking_seats` update repeats the guard. Once REFUNDED, neither the retry
- * job nor a late webhook can select the booking again.
+ * At-most-once transition, not exactly-once provider calls: the row lock + the
+ * `status = 'FAILED'` predicate make the FAILED -> REFUNDED commit happen at
+ * most once per booking, and the `booking_seats` update repeats the guard. One
+ * residual crash window remains: if the process dies after `provider.refund`
+ * returned successfully but before this transaction commits, the booking is
+ * still FAILED when it restarts, so the next run refunds it again. That retry
+ * relies on the provider treating a repeated refund for the same payment ref
+ * idempotently (the doc accepts this idempotent-retry design). A committed
+ * REFUNDED booking is never selected again.
  *
  * A provider error is logged and swallowed: the booking stays FAILED and the
  * next run retries it. The caller (webhook route) still answers 200.

@@ -1,3 +1,4 @@
+import type { BookingStatus, SeatStatus } from "@seatsync/shared";
 import type { Pool, PoolClient, QueryResultRow } from "pg";
 import type { Config } from "../config";
 import { ApiError } from "../middleware/errors";
@@ -279,8 +280,6 @@ export interface ProcessWebhookEventResult {
   refundBookingId: string | null;
 }
 
-type BookingStatus = "PENDING" | "CONFIRMED" | "FAILED" | "REFUNDED";
-
 interface WebhookBookingRow extends QueryResultRow {
   id: string;
   event_id: string;
@@ -368,25 +367,32 @@ export async function processWebhookEvent(
     // already-processed path can never observe it.
     provider.runAfterDedupeHook?.();
 
-    const locked = await client.query<WebhookBookingRow>(
-      `SELECT id, event_id, hold_id, status, payment_ref, amount_paise
-         FROM bookings
-        WHERE id = $1
-        FOR UPDATE`,
-      [event.bookingId],
-    );
+    // Rule 2 lock (design.md:143-147): when the event carries a hold id, the
+    // hold binding is part of the lock predicate, so a mismatched payload
+    // locks 0 rows and commits as a no-op. The fake provider permits events
+    // without holdId (doc-unspecified), and those lock by booking id alone.
+    const locked =
+      event.holdId === undefined
+        ? await client.query<WebhookBookingRow>(
+            `SELECT id, event_id, hold_id, status, payment_ref, amount_paise
+               FROM bookings
+              WHERE id = $1
+              FOR UPDATE`,
+            [event.bookingId],
+          )
+        : await client.query<WebhookBookingRow>(
+            `SELECT id, event_id, hold_id, status, payment_ref, amount_paise
+               FROM bookings
+              WHERE id = $1
+                AND hold_id = $2
+              FOR UPDATE`,
+            [event.bookingId, event.holdId],
+          );
     const booking = locked.rows[0];
 
+    // 0 rows: unknown booking, or one bound to a different hold. Either way
+    // the dedupe row stays committed and the delivery is a 200 no-op.
     if (booking === undefined) {
-      await client.query("COMMIT");
-      transactionOpen = false;
-
-      return { alreadyProcessed: false, refundBookingId: null };
-    }
-
-    // An event carrying a hold id must belong to the booking bound to that
-    // hold; otherwise it is a mismatched payload and changes nothing.
-    if (event.holdId !== undefined && booking.hold_id !== event.holdId) {
       await client.query("COMMIT");
       transactionOpen = false;
 
@@ -585,4 +591,169 @@ export async function processWebhookEvent(
   } finally {
     client.release();
   }
+}
+
+/** One seat on a booking detail read, joined to its live seat row. */
+export interface BookingSeatViewRecord {
+  seatId: string;
+  section: string;
+  rowLabel: string;
+  number: number;
+  /** The live seat status (AVAILABLE / HELD / BOOKED), from `seats`. */
+  status: SeatStatus;
+  pricePaise: number;
+}
+
+export interface BookingDetailInput {
+  bookingId: string;
+  userId: string;
+}
+
+export interface BookingDetailRecord {
+  id: string;
+  eventId: string;
+  status: BookingStatus;
+  amountPaise: number;
+  paymentRef: string | null;
+  checkoutUrl: string | null;
+  holdId: string;
+  createdAt: Date;
+  /** `bookings.user_id = $2`, computed by the booking row query. */
+  owned: boolean;
+  seats: BookingSeatViewRecord[];
+}
+
+export interface UserBookingRecord {
+  id: string;
+  eventId: string;
+  eventTitle: string;
+  eventStartsAt: Date;
+  status: BookingStatus;
+  amountPaise: number;
+  seatCount: number;
+  createdAt: Date;
+}
+
+interface BookingDetailBookingRow extends QueryResultRow {
+  id: string;
+  event_id: string;
+  status: BookingStatus;
+  amount_paise: number;
+  payment_ref: string | null;
+  checkout_url: string | null;
+  hold_id: string;
+  created_at: Date;
+  owned: boolean;
+}
+
+interface BookingSeatViewRow extends QueryResultRow {
+  seat_id: string;
+  section: string;
+  row_label: string;
+  number: number;
+  status: SeatStatus;
+  price_paise: number;
+}
+
+interface UserBookingRow extends QueryResultRow {
+  id: string;
+  event_id: string;
+  event_title: string;
+  event_starts_at: Date;
+  status: BookingStatus;
+  amount_paise: number;
+  seat_count: number;
+  created_at: Date;
+}
+
+/**
+ * D25 owner-scoped booking detail.
+ *
+ * The booking row is selected by id alone with `user_id = $2` computed as an
+ * `owned` flag, so a missing booking (404) and another user's booking (403)
+ * stay distinguishable without a second query. The seats join reads the live
+ * seat state for section/row/number/status/price; `booking_seats` supplies
+ * membership.
+ */
+export async function getBookingDetail(
+  pool: Pool,
+  input: BookingDetailInput,
+): Promise<BookingDetailRecord | null> {
+  const bookingResult = await pool.query<BookingDetailBookingRow>(
+    `SELECT id, event_id, status, amount_paise, payment_ref, checkout_url,
+            hold_id, created_at, (user_id = $2) AS owned
+       FROM bookings
+      WHERE id = $1`,
+    [input.bookingId, input.userId],
+  );
+  const booking = bookingResult.rows[0];
+
+  if (booking === undefined) {
+    return null;
+  }
+
+  const seatResult = await pool.query<BookingSeatViewRow>(
+    `SELECT bs.seat_id, s.section, s.row_label, s.number, s.status,
+            s.price_paise
+       FROM booking_seats bs
+       JOIN seats s ON s.id = bs.seat_id
+      WHERE bs.booking_id = $1
+      ORDER BY s.section, s.row_label, s.number`,
+    [input.bookingId],
+  );
+
+  return {
+    id: booking.id,
+    eventId: booking.event_id,
+    status: booking.status,
+    amountPaise: booking.amount_paise,
+    paymentRef: booking.payment_ref,
+    checkoutUrl: booking.checkout_url,
+    holdId: booking.hold_id,
+    createdAt: booking.created_at,
+    owned: booking.owned,
+    seats: seatResult.rows.map((seat) => ({
+      seatId: seat.seat_id,
+      section: seat.section,
+      rowLabel: seat.row_label,
+      number: seat.number,
+      status: seat.status,
+      pricePaise: seat.price_paise,
+    })),
+  };
+}
+
+/**
+ * D25 `GET /me/bookings`: the caller's bookings, newest first, with event
+ * title/start and a seat count. The query is owner-scoped, so another user's
+ * rows never enter the result.
+ */
+export async function listUserBookings(
+  pool: Pool,
+  userId: string,
+): Promise<UserBookingRecord[]> {
+  const result = await pool.query<UserBookingRow>(
+    `SELECT b.id, b.event_id, e.title AS event_title,
+            e.starts_at AS event_starts_at, b.status, b.amount_paise,
+            b.created_at,
+            (SELECT count(*)::int
+               FROM booking_seats bs
+              WHERE bs.booking_id = b.id) AS seat_count
+       FROM bookings b
+       JOIN events e ON e.id = b.event_id
+      WHERE b.user_id = $1
+      ORDER BY b.created_at DESC, b.id DESC`,
+    [userId],
+  );
+
+  return result.rows.map((booking) => ({
+    id: booking.id,
+    eventId: booking.event_id,
+    eventTitle: booking.event_title,
+    eventStartsAt: booking.event_starts_at,
+    status: booking.status,
+    amountPaise: booking.amount_paise,
+    seatCount: booking.seat_count,
+    createdAt: booking.created_at,
+  }));
 }
