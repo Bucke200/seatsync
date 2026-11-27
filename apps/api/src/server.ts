@@ -2,7 +2,9 @@ import { createApp } from "./app";
 import { loadConfig, type Config } from "./config";
 import { createPool } from "./db/pool";
 import { startExpireHoldsJob } from "./jobs/expireHolds";
+import { startRetryRefundsJob } from "./jobs/retryRefunds";
 import { logger } from "./logger";
+import { createPaymentProvider } from "./payments";
 import { createRedisClient } from "./realtime/redis";
 
 const PORT = 4000;
@@ -22,6 +24,21 @@ function main(): void {
   const redis = createRedisClient(config);
   const app = createApp({ pool, redis });
   const sweeperTimer = startExpireHoldsJob(pool, config, logger);
+  // D24: refund retries share the sweeper cadence (doc-unspecified interval,
+  // recorded in the Sprint 3 report) and, like the sweeper, never run at boot
+  // (D16). A provider that cannot be built (e.g. unimplemented stripe) leaves
+  // the HTTP app serving; the job simply stays off.
+  let refundTimer: NodeJS.Timeout | null = null;
+
+  try {
+    const paymentProvider = createPaymentProvider(config);
+    refundTimer = startRetryRefundsJob(pool, config, paymentProvider);
+  } catch (error) {
+    logger.error(
+      { err: error },
+      "refund retry job not started: payment provider unavailable",
+    );
+  }
 
   const server = app.listen(PORT, () => {
     logger.info({ port: PORT }, "SeatSync API listening");
@@ -35,6 +52,9 @@ function main(): void {
   const shutdown = (signal: NodeJS.Signals): void => {
     logger.info({ signal }, "shutting down");
     clearInterval(sweeperTimer);
+    if (refundTimer !== null) {
+      clearInterval(refundTimer);
+    }
     server.close(() => {
       const cleanup: Array<Promise<unknown>> = [pool.end()];
 

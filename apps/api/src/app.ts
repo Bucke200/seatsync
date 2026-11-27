@@ -12,6 +12,7 @@ import { createBookingsRouter } from "./routes/bookings";
 import { createEventsRouter } from "./routes/events";
 import { createHealthRouter } from "./routes/health";
 import { createHoldsRouter } from "./routes/holds";
+import { createWebhooksRouter } from "./routes/webhooks";
 
 export interface AppDependencies {
   pool: Pool;
@@ -33,6 +34,15 @@ export function createApp({
 
   app.disable("x-powered-by");
   app.use(requestIdMiddleware);
+
+  // D22: the webhook HMAC is computed over the exact delivered bytes. Mount
+  // the raw parser (and the webhook router) before `express.json()` so only
+  // `/webhooks/*` gets a Buffer; JSON body parsing stays on for every other
+  // route. body-parser marks the request as parsed, so express.json() skips
+  // these requests instead of reserializing them.
+  app.use("/webhooks", express.raw({ type: "*/*" }));
+  app.use("/webhooks", createWebhooksRouter(pool, config));
+
   app.use(express.json());
   app.use(cookieParser());
   app.use("/health", createHealthRouter({ pool, redis }));
