@@ -1,7 +1,9 @@
 import path from "node:path";
+import process from "node:process";
 import { fileURLToPath } from "node:url";
 
 const projectRoot = path.dirname(fileURLToPath(import.meta.url));
+const apiProxyTarget = process.env.API_PROXY_TARGET ?? "http://localhost:4000";
 
 /** @type {import("next").NextConfig} */
 const nextConfig = {
@@ -14,6 +16,16 @@ const nextConfig = {
   // Linting is a separate CI step (`pnpm lint`); a production image build only
   // needs the type check and the compiled app.
   eslint: { ignoreDuringBuilds: true },
+  // @seatsync/shared ships TypeScript source, so Next must transpile it.
+  transpilePackages: ["@seatsync/shared"],
+  async rewrites() {
+    return [
+      {
+        source: "/api/:path*",
+        destination: `${apiProxyTarget}/:path*`,
+      },
+    ];
+  },
 };
 
 export default nextConfig;
