@@ -76,6 +76,18 @@ export function errorHandler(
     return;
   }
 
+  // body-parser throws a SyntaxError for malformed JSON. Never log it: the
+  // error carries the raw request body, which may contain credentials.
+  if (error instanceof SyntaxError) {
+    res.status(400).json({
+      error: {
+        code: "INVALID_JSON",
+        message: "Invalid JSON body",
+      },
+    } satisfies ErrorResponse);
+    return;
+  }
+
   req.log.error({ err: error }, "unhandled request error");
   res.status(500).json({
     error: {

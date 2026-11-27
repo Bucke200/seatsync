@@ -198,4 +198,16 @@ describe("auth", () => {
     expect(invalid.body.error.code).toBe("VALIDATION_ERROR");
     expect(Array.isArray(invalid.body.error.details)).toBe(true);
   });
+
+  it("returns 400 INVALID_JSON for a malformed JSON body", async () => {
+    const response = await request(app)
+      .post("/auth/login")
+      .set("Content-Type", "application/json")
+      .send('{"email":');
+
+    expect(response.status).toBe(400);
+    expect(response.body).toEqual({
+      error: { code: "INVALID_JSON", message: "Invalid JSON body" },
+    });
+  });
 });
