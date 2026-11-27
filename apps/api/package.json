@@ -5,6 +5,8 @@
   "description": "SeatSync HTTP API",
   "scripts": {
     "dev": "node -r dotenv/config --env-file-if-exists=../../.env --import tsx src/server.ts",
+    "start": "node --env-file-if-exists=../../.env --import tsx src/server.ts",
+    "migrate": "node --env-file-if-exists=../../.env node_modules/node-pg-migrate/bin/node-pg-migrate.js -m migrations -d DATABASE_URL",
     "lint": "eslint .",
     "typecheck": "tsc --noEmit",
     "test": "node -e \"process.exit(0)\""
@@ -23,6 +25,7 @@
     "@types/express-serve-static-core": "^4.19.9",
     "@types/node": "^22.10.5",
     "@types/pg": "^8.11.10",
+    "node-pg-migrate": "^7.9.0",
     "tsx": "^4.19.2",
     "typescript": "^5.7.3"
   }

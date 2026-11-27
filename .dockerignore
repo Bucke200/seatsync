@@ -1,0 +1,32 @@
+# Deterministic builds: never copy host artifacts into the image.
+.git
+.gitignore
+.gitattributes
+.opencode
+.vscode
+.idea
+
+# Dependencies are installed from the lockfile inside the image.
+**/node_modules
+
+# Build output and test artifacts.
+**/dist
+**/build
+**/.next
+**/out
+**/coverage
+**/*.tsbuildinfo
+**/next-env.d.ts
+
+# Local environment files must never be baked into an image.
+.env
+.env.*
+!.env.example
+
+# Logs and OS noise.
+**/*.log
+**/.DS_Store
+**/Thumbs.db
+
+# Docs are not needed by either runtime image.
+docs

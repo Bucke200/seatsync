@@ -16,6 +16,15 @@ export default tseslint.config(
   js.configs.recommended,
   ...tseslint.configs.recommended,
   {
+    // node-pg-migrate migrations are CommonJS files loaded by the CLI.
+    files: ["apps/api/migrations/**/*.js"],
+    languageOptions: {
+      globals: {
+        ...globals.node,
+      },
+    },
+  },
+  {
     files: ["**/*.ts", "**/*.tsx"],
     languageOptions: {
       globals: {
