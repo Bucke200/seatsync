@@ -10,6 +10,7 @@ import { generateOpenApiDocument } from "./openapi";
 import { createAuthRouter } from "./routes/auth";
 import { createEventsRouter } from "./routes/events";
 import { createHealthRouter } from "./routes/health";
+import { createHoldsRouter } from "./routes/holds";
 
 export interface AppDependencies {
   pool: Pool;
@@ -36,6 +37,8 @@ export function createApp({
   app.use("/health", createHealthRouter({ pool, redis }));
   app.use("/auth", createAuthRouter(pool, config));
   app.use("/events", createEventsRouter(pool, config));
+  // Two prefixes under one router (`/events/{id}/holds`, `/holds/{id}`).
+  app.use(createHoldsRouter(pool, config));
 
   const openApiDocument = generateOpenApiDocument();
   const swaggerHtml = swaggerUi.generateHTML(openApiDocument);

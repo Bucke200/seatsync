@@ -75,8 +75,14 @@ async function requireOwnedEvent(
   return event;
 }
 
-async function buildEventDetail(pool: Pool, event: EventRecord): Promise<EventDetail> {
-  const seats = await listSeatsByEventId(pool, event.id);
+async function buildEventDetail(
+  pool: Pool,
+  event: EventRecord,
+  viewerUserId?: string,
+): Promise<EventDetail> {
+  // D15: only the viewer's own active hold adds holdId/heldUntil/heldByMe;
+  // every other seat and every anonymous read omits them.
+  const seats = await listSeatsByEventId(pool, event.id, { viewerUserId });
 
   return { ...toEventSummary(event), seats };
 }
@@ -142,7 +148,7 @@ export async function getEventDetail(
     throw eventNotFound();
   }
 
-  return buildEventDetail(pool, event);
+  return buildEventDetail(pool, event, viewer?.id);
 }
 
 export async function updateEvent(

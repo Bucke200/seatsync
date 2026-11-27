@@ -53,7 +53,8 @@ function toAuthUser(user: UserRecord): AuthUser {
   return { id: user.id, email: user.email, role: user.role };
 }
 
-function signAccessToken(config: Config, user: AuthUser): string {
+/** Exported for the Sprint 2 race test seeding (D11); behaviour is unchanged. */
+export function signAccessToken(config: Config, user: AuthUser): string {
   return jwt.sign(
     { sub: user.id, role: user.role, jti: randomUUID() },
     config.JWT_SECRET,

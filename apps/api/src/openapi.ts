@@ -13,6 +13,8 @@ import {
   SeatSchema,
   EventDetailSchema,
   PaginatedEventsResponseSchema,
+  HoldRequestSchema,
+  HoldResponseSchema,
 } from "@seatsync/shared";
 import {
   OpenAPIRegistry,
@@ -22,6 +24,18 @@ import {
 import { z } from "zod";
 
 const EventIdParamsSchema = z.object({ id: z.string().uuid() });
+const HoldIdParamsSchema = z.object({ id: z.string().uuid() });
+const IdempotencyKeyHeaderSchema = z.object({
+  "Idempotency-Key": z
+    .string()
+    .min(1)
+    .openapi({
+      description:
+        "Client-generated idempotency key. Reusing a key with the same user and " +
+        "body replays the stored response; a different user or body returns 422.",
+      example: "3f1c2a0e-8b1e-4f0a-9a5e-9d1f6b7c8d90",
+    }),
+});
 
 function jsonResponse(description: string, schema: z.ZodTypeAny): ResponseConfig {
   return {
@@ -59,6 +73,8 @@ export function generateOpenApiDocument() {
   registry.register("Seat", SeatSchema);
   registry.register("EventDetail", EventDetailSchema);
   registry.register("PaginatedEventsResponse", PaginatedEventsResponseSchema);
+  registry.register("HoldRequest", HoldRequestSchema);
+  registry.register("HoldResponse", HoldResponseSchema);
 
   registry.registerComponent("securitySchemes", "bearerAuth", {
     type: "http",
@@ -251,6 +267,52 @@ export function generateOpenApiDocument() {
       401: errorResponse("Missing or invalid access token"),
       403: errorResponse("Organizer role required or event not owned"),
       404: errorResponse("Event not found"),
+    },
+  });
+
+  registry.registerPath({
+    method: "post",
+    path: "/events/{id}/holds",
+    tags: ["holds"],
+    summary: "Hold seats for HOLD_TTL_SECONDS",
+    description:
+      "Rule 1 lock-then-update: the request either holds every requested seat " +
+      "or none. Requires the Idempotency-Key header; a replay of the same key, " +
+      "user and body returns the stored response verbatim.",
+    security: [{ bearerAuth: [] }],
+    request: {
+      params: EventIdParamsSchema,
+      headers: IdempotencyKeyHeaderSchema,
+      body: {
+        required: true,
+        content: { "application/json": { schema: HoldRequestSchema } },
+      },
+    },
+    responses: {
+      201: jsonResponse("Every requested seat is HELD for this user", HoldResponseSchema),
+      400: errorResponse("Missing or blank Idempotency-Key header"),
+      401: errorResponse("Missing or invalid access token"),
+      404: errorResponse("Event not found or draft hidden"),
+      409: errorResponse("One or more seats are unavailable, or the user already holds seats"),
+      422: errorResponse("Invalid seat ids, too many seats, or idempotency key conflict"),
+    },
+  });
+
+  registry.registerPath({
+    method: "delete",
+    path: "/holds/{id}",
+    tags: ["holds"],
+    summary: "Release a hold; only the holder may release it",
+    security: [{ bearerAuth: [] }],
+    request: {
+      params: HoldIdParamsSchema,
+    },
+    responses: {
+      204: { description: "Hold released and every seat is AVAILABLE again" },
+      400: errorResponse("Hold id is not a UUID"),
+      401: errorResponse("Missing or invalid access token"),
+      403: errorResponse("The authenticated user is not the holder"),
+      404: errorResponse("Hold not found or already expired"),
     },
   });
 
