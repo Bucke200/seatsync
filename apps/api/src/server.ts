@@ -5,7 +5,9 @@ import { startExpireHoldsJob } from "./jobs/expireHolds";
 import { startRetryRefundsJob } from "./jobs/retryRefunds";
 import { logger } from "./logger";
 import { createPaymentProvider } from "./payments";
-import { createPubSubClients, createRedisClient } from "./realtime/redis";
+import { startSeatEventPublisher } from "./realtime/publisher";
+import { createRedisClient } from "./realtime/redis";
+import { startSeatEventSubscriber } from "./realtime/subscriber";
 import { attachRealtimeServer } from "./realtime/ws";
 
 const PORT = 4000;
@@ -46,10 +48,12 @@ function main(): void {
   });
 
   // D28: the WebSocket server shares the HTTP listen socket at `/ws`. Step 2
-  // wires the pub/sub clients to this hub; both are created here so their
-  // lifecycle and the shutdown order live in one place.
+  // connects the in-process seat emitter to Redis and Redis back into this
+  // attachment's rooms. Both pub/sub clients are dedicated (D26) and are
+  // stopped by their handles during shutdown.
   const realtime = attachRealtimeServer(server, { config });
-  const pubsub = createPubSubClients(config);
+  const publisher = startSeatEventPublisher({ config, logger });
+  const subscriber = startSeatEventSubscriber({ config, hub: realtime.hub, logger });
 
   server.on("error", (error) => {
     logger.fatal({ err: error }, "HTTP server error");
@@ -64,16 +68,20 @@ function main(): void {
     }
 
     // Shutdown order: stop accepting new sockets and terminate live WebSocket
-    // connections first, then let the HTTP server drain, then close Redis
-    // (pub/sub included). Both pub/sub clients were never subscribed in step 1
-    // and `disconnect()` is safe even from `wait`/`reconnecting`.
+    // connections first, then stop the pub/sub bridge (so no Redis message is
+    // delivered into a closing hub), let the HTTP server drain, then close
+    // Redis (health client included).
     const realtimeClosed = realtime.close();
+    const publisherStopped = publisher.stop();
+    const subscriberStopped = subscriber.stop();
 
     server.close(() => {
-      const cleanup: Array<Promise<unknown>> = [realtimeClosed, pool.end()];
-
-      pubsub.publisher.disconnect();
-      pubsub.subscriber.disconnect();
+      const cleanup: Array<Promise<unknown>> = [
+        realtimeClosed,
+        publisherStopped,
+        subscriberStopped,
+        pool.end(),
+      ];
 
       if (redis.status !== "wait" && redis.status !== "end") {
         cleanup.push(redis.quit());

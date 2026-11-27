@@ -22,6 +22,43 @@ export interface PubSubClients {
   subscriber: Redis;
 }
 
+/** Shared resilience options for every pub/sub connection (D26). */
+const PUBSUB_CLIENT_OPTIONS = {
+  lazyConnect: true,
+  enableOfflineQueue: false,
+  maxRetriesPerRequest: 1,
+  retryStrategy: pubSubRetryStrategy,
+} as const;
+
+function attachErrorLogger(client: Redis, log: Logger, label: string): void {
+  // Mandatory: without an `error` listener ioredis emits an unhandled event
+  // and crashes the process when Redis is down.
+  client.on("error", (error) => {
+    log.warn({ err: error }, `${label}; live updates degraded`);
+  });
+}
+
+/**
+ * Create one dedicated publisher connection (D26).
+ *
+ * Step 2 exposes single-client factories so the publisher and subscriber each
+ * own exactly one connection; creating a pair for every role would leak an
+ * unused client per process. Both factories apply the identical resilience
+ * settings described on `createPubSubClients`.
+ */
+export function createPubSubPublisher(config: Config, log: Logger = logger): Redis {
+  const client = new Redis(config.REDIS_URL, PUBSUB_CLIENT_OPTIONS);
+  attachErrorLogger(client, log, "Redis pub/sub publisher error");
+  return client;
+}
+
+/** Create one dedicated subscriber connection (D26). */
+export function createPubSubSubscriber(config: Config, log: Logger = logger): Redis {
+  const client = new Redis(config.REDIS_URL, PUBSUB_CLIENT_OPTIONS);
+  attachErrorLogger(client, log, "Redis pub/sub subscriber error");
+  return client;
+}
+
 /**
  * Create the shared Redis client.
  *
@@ -66,26 +103,10 @@ export function createRedisClient(config: Config, log: Logger = logger): Redis {
  * `retryStrategy`.
  */
 export function createPubSubClients(config: Config, log: Logger = logger): PubSubClients {
-  const options = {
-    lazyConnect: true,
-    enableOfflineQueue: false,
-    maxRetriesPerRequest: 1,
-    retryStrategy: pubSubRetryStrategy,
-  } as const;
-
-  const publisher = new Redis(config.REDIS_URL, options);
-  const subscriber = new Redis(config.REDIS_URL, options);
-
-  // Mandatory: without an `error` listener ioredis emits an unhandled event
-  // and crashes the process when Redis is down.
-  publisher.on("error", (error) => {
-    log.warn({ err: error }, "Redis pub/sub publisher error; live updates degraded");
-  });
-  subscriber.on("error", (error) => {
-    log.warn({ err: error }, "Redis pub/sub subscriber error; live updates degraded");
-  });
-
-  return { publisher, subscriber };
+  return {
+    publisher: createPubSubPublisher(config, log),
+    subscriber: createPubSubSubscriber(config, log),
+  };
 }
 
 /**
