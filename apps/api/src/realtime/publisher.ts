@@ -48,9 +48,16 @@ export interface StartSeatEventPublisherOptions {
 
 export interface SeatEventPublisherHandle {
   /**
-   * Resolves once the publisher's Redis connection is ready. Production code
-   * ignores it; tests await it so a first publish cannot race the handshake.
-   * It stays pending while Redis is down (messages are dropped, not queued).
+   * Settles exactly once and therefore can never hang:
+   * - resolves when the publisher's Redis connection first becomes usable;
+   * - rejects with a clear error when the first connection attempt fails while
+   *   still connecting, or when `stop()` runs before readiness.
+   *
+   * Production ignores it (the handle attaches an internal no-op catch, so a
+   * Redis-down boot cannot produce an unhandled rejection). Tests own the only
+   * await and should treat a rejection as "Redis is unavailable" rather than
+   * waiting forever. Messages published while Redis is down are dropped, never
+   * queued.
    */
   ready: Promise<void>;
   /** Stop listening to `seatEvents`, drop pending work and disconnect. */
@@ -74,11 +81,54 @@ export function startSeatEventPublisher({
   let flushScheduled = false;
   let stopped = false;
 
-  const ready = new Promise<void>((resolve) => {
-    client.once("ready", () => {
-      resolve();
-    });
+  /** Readiness settles exactly once: resolve on 'ready', reject on failure/stop. */
+  let readySettled = false;
+  let resolveReady: () => void = () => {};
+  let rejectReady: (error: Error) => void = () => {};
+
+  const ready = new Promise<void>((resolve, reject) => {
+    resolveReady = resolve;
+    rejectReady = reject;
   });
+
+  // Readiness is informational in production; only tests await it. Attach a
+  // no-op rejection handler immediately so a Redis-down boot never raises an
+  // unhandled rejection. Consumers still observe the rejection themselves.
+  void ready.catch(() => {});
+
+  /** Detach the readiness listeners so a stopped client cannot settle later. */
+  function detachReadyListeners(): void {
+    client.off("ready", onReady);
+    client.off("error", onReadyError);
+  }
+
+  function onReady(): void {
+    if (readySettled) {
+      return;
+    }
+
+    readySettled = true;
+    detachReadyListeners();
+    resolveReady();
+  }
+
+  function onReadyError(error: Error): void {
+    if (readySettled) {
+      return;
+    }
+
+    // First connection error before readiness: fail fast instead of leaving
+    // `ready` pending forever. `retryStrategy` still reconnects in the
+    // background, but this handle's readiness was already falsified.
+    readySettled = true;
+    detachReadyListeners();
+    rejectReady(
+      new Error(`Redis pub/sub publisher was not ready: ${error.message}`, { cause: error }),
+    );
+  }
+
+  client.once("ready", onReady);
+  client.on("error", onReadyError);
 
   function flush(): void {
     flushScheduled = false;
@@ -175,6 +225,15 @@ export function startSeatEventPublisher({
     pending.clear();
     // The already-queued microtask (if any) observes `stopped` and no-ops.
     flushScheduled = false;
+    // Remove the readiness listeners *before* disconnecting: a 'ready' or
+    // 'error' emitted by the dying client must not settle `ready` afterwards.
+    detachReadyListeners();
+
+    if (!readySettled) {
+      readySettled = true;
+      rejectReady(new Error("Redis pub/sub publisher stopped before becoming ready"));
+    }
+
     client.disconnect();
   }
 

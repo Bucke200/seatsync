@@ -18,8 +18,8 @@ import type { RealtimeHub } from "./ws";
  * One dedicated subscriber connection per API instance (D26): `PSUBSCRIBE`
  * permanently puts an ioredis connection into subscriber mode, so the shared
  * `/health` client can never be used here. With `enableOfflineQueue: false`
- * the initial `PSUBSCRIBE` must run after the connection is ready; ioredis's
- * `autoResubscribe` re-issues it on reconnects by itself.
+ * the initial `PSUBSCRIBE` must run after the connection is ready; the explicit
+ * `autoResubscribe: true` option re-issues it on reconnects by itself.
  *
  * Every failure is logged and swallowed: a corrupt message or Redis outage
  * must never crash the API, and a dropped live update is acceptable because
@@ -48,9 +48,15 @@ export interface StartSeatEventSubscriberOptions {
 
 export interface SeatEventSubscriberHandle {
   /**
-   * Resolves once the initial `psubscribe("seats:*")` has completed. Tests
-   * await it before publishing; production code ignores it. It stays pending
-   * while Redis is down.
+   * Settles exactly once and therefore can never hang:
+   * - resolves once the initial `psubscribe("seats:*")` has completed;
+   * - rejects with a clear error on the first connection error before that, if
+   *   the initial `psubscribe` fails, or when `stop()` runs before readiness.
+   *
+   * Production ignores it (the handle attaches an internal no-op catch, so a
+   * Redis-down boot cannot produce an unhandled rejection). Tests own the only
+   * await and should treat a rejection as "Redis is unavailable". After a
+   * rejection the subscriber still retries in the background on reconnect.
    */
   ready: Promise<void>;
   /** Unsubscribe, detach listeners and disconnect. Safe to call twice. */
@@ -68,31 +74,95 @@ export function startSeatEventSubscriber({
   let subscribed = false;
   let stopped = false;
 
-  const ready = new Promise<void>((resolve) => {
-    client.on("ready", () => {
-      if (stopped) {
-        return;
-      }
+  /** Readiness settles exactly once: resolve on subscribe, reject otherwise. */
+  let readySettled = false;
+  let resolveReady: () => void = () => {};
+  let rejectReady: (error: Error) => void = () => {};
 
-      if (subscribed) {
-        // `autoResubscribe` has already re-issued PSUBSCRIBE on a reconnect.
-        resolve();
-        return;
-      }
-
-      subscribed = true;
-      void client.psubscribe(SEAT_EVENT_PATTERN).then(
-        () => {
-          resolve();
-        },
-        (error: unknown) => {
-          // Ready but not subscribed: allow the next reconnect to retry.
-          subscribed = false;
-          log.warn({ err: error }, "Redis seats:* psubscribe failed; live updates degraded");
-        },
-      );
-    });
+  const ready = new Promise<void>((resolve, reject) => {
+    resolveReady = resolve;
+    rejectReady = reject;
   });
+
+  // Readiness is informational in production; only tests await it. Attach a
+  // no-op rejection handler immediately so a Redis-down boot never raises an
+  // unhandled rejection. Consumers still observe the rejection themselves.
+  void ready.catch(() => {});
+
+  /** Detach the readiness listeners so a stopped client cannot settle later. */
+  function detachReadyListeners(): void {
+    client.off("ready", onReady);
+    client.off("error", onReadyError);
+  }
+
+  function settleReady(): void {
+    if (readySettled) {
+      return;
+    }
+
+    readySettled = true;
+    detachReadyListeners();
+    resolveReady();
+  }
+
+  function failReady(error: Error): void {
+    if (readySettled) {
+      return;
+    }
+
+    readySettled = true;
+    // Keep the 'ready' listener: `subscribed` goes back to false, so a later
+    // reconnect can still establish the subscription even though `ready`
+    // already settled as failed. Only the readiness error listener goes away,
+    // so the failure is reported once.
+    client.off("error", onReadyError);
+    rejectReady(error);
+  }
+
+  function onReady(): void {
+    if (stopped) {
+      return;
+    }
+
+    if (subscribed) {
+      // `autoResubscribe` has already re-issued PSUBSCRIBE on a reconnect.
+      settleReady();
+      return;
+    }
+
+    subscribed = true;
+    void client.psubscribe(SEAT_EVENT_PATTERN).then(
+      () => {
+        settleReady();
+      },
+      (error: unknown) => {
+        // Ready but not subscribed: allow the next reconnect to retry.
+        subscribed = false;
+        log.warn({ err: error }, "Redis seats:* psubscribe failed; live updates degraded");
+        failReady(
+          new Error(
+            `Redis pub/sub subscriber psubscribe failed: ${
+              error instanceof Error ? error.message : String(error)
+            }`,
+            { cause: error },
+          ),
+        );
+      },
+    );
+  }
+
+  function onReadyError(error: Error): void {
+    if (stopped) {
+      return;
+    }
+
+    failReady(
+      new Error(`Redis pub/sub subscriber was not ready: ${error.message}`, { cause: error }),
+    );
+  }
+
+  client.on("ready", onReady);
+  client.on("error", onReadyError);
 
   function onPmessage(_pattern: string, channel: string, message: string): void {
     // pmessage itself must never throw: an unhandled 'error' from the emitter
@@ -158,7 +228,15 @@ export function startSeatEventSubscriber({
     }
 
     stopped = true;
+    // Remove the readiness listeners *before* disconnecting: a 'ready' or
+    // 'error' emitted by the dying client must not settle `ready` afterwards.
+    detachReadyListeners();
     client.off("pmessage", onPmessage);
+
+    if (!readySettled) {
+      readySettled = true;
+      rejectReady(new Error("Redis pub/sub subscriber stopped before becoming ready"));
+    }
 
     if (client.status === "ready") {
       try {

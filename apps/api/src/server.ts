@@ -67,15 +67,27 @@ function main(): void {
       clearInterval(refundTimer);
     }
 
-    // Shutdown order: stop accepting new sockets and terminate live WebSocket
-    // connections first, then stop the pub/sub bridge (so no Redis message is
-    // delivered into a closing hub), let the HTTP server drain, then close
-    // Redis (health client included).
+    // Shutdown order (drain-safe):
+    // 1. Close the WebSocket attachment FIRST. Upgraded sockets are not part of
+    //    the HTTP request drain, so leaving them open would keep
+    //    `server.close()` waiting; this also clears the rooms so no later
+    //    broadcast can target a socket that is already gone.
+    // 2. `server.close()` stops accepting connections and drains in-flight HTTP
+    //    requests. The publisher and subscriber deliberately stay alive here:
+    //    a hold/booking that commits during the drain must still publish its
+    //    live update instead of losing it.
+    // 3. Only in the close callback (drain finished, so no request can emit a
+    //    seat change any more) stop the publisher, then the subscriber: the
+    //    publisher first removes the sole `seatEvents` listener, so nothing new
+    //    can be published, and stopping the subscriber next guarantees no
+    //    Redis -> hub broadcast outlives the drain. The WS server is already
+    //    closed, so nothing can be written to a closed socket. Redis (health
+    //    client) and the pool go last.
     const realtimeClosed = realtime.close();
-    const publisherStopped = publisher.stop();
-    const subscriberStopped = subscriber.stop();
 
     server.close(() => {
+      const publisherStopped = publisher.stop();
+      const subscriberStopped = subscriber.stop();
       const cleanup: Array<Promise<unknown>> = [
         realtimeClosed,
         publisherStopped,

@@ -237,8 +237,17 @@ describe("realtime publisher/subscriber", () => {
     subscriber = startSeatEventSubscriber({ config, hub: realtime.hub, logger: log });
 
     // Both connections are ready before any test publishes, so the first
-    // message cannot race the pub/sub handshake.
-    await Promise.all([publisher.ready, subscriber.ready]);
+    // message cannot race the pub/sub handshake. A Redis-down environment
+    // rejects instead of leaving `ready` pending, so fail fast and clearly
+    // rather than hanging the suite; teardown still runs.
+    try {
+      await Promise.all([publisher.ready, subscriber.ready]);
+    } catch (error) {
+      throw new Error(
+        "realtime pub/sub is unavailable; these tests require a running Redis",
+        { cause: error },
+      );
+    }
   });
 
   beforeEach(async () => {
@@ -404,6 +413,66 @@ describe("realtime publisher/subscriber", () => {
       expect(wsSeatFrames).toEqual([payload]);
     } finally {
       await socket.close();
+      wireTap.disconnect();
+      sentinelClient.disconnect();
+    }
+  });
+
+  it("keeps only the later write when the same seat changes twice in one tick (D27)", async () => {
+    const organizer = await signupUser("ORGANIZER");
+    const event = await createPublishedEvent(organizer.accessToken);
+
+    const [seat] = event.seats;
+
+    if (seat === undefined) {
+      throw new Error("Expected a seat");
+    }
+
+    const wireTap = new Redis(config.REDIS_URL);
+    const sentinelClient = new Redis(config.REDIS_URL);
+    const channel = seatEventChannel(event.id);
+    const sentinel = `latest-${randomUUID()}`;
+
+    // Both helper connections must never crash the test on a Redis error.
+    wireTap.on("error", () => {});
+    sentinelClient.on("error", () => {});
+
+    try {
+      const tap = createWireTap(wireTap, channel);
+
+      await tap.subscribe();
+
+      // Same synchronous tick: the publisher's per-event/microtask batch sees
+      // both writes, and the per-seat map must keep only the later one.
+      emitSeatChange({
+        eventId: event.id,
+        seatIds: [seat.id],
+        status: "AVAILABLE",
+        version: 2,
+      });
+      emitSeatChange({
+        eventId: event.id,
+        seatIds: [seat.id],
+        status: "HELD",
+        version: 3,
+      });
+
+      const message = await tap.waitFor((entry) => entry.channel === channel);
+
+      expect(parseSeatMessage(message.message)).toEqual({
+        eventId: event.id,
+        seats: [{ id: seat.id, status: "HELD", version: 3 }],
+      });
+
+      // Sentinel: any further publish queued for this event would arrive before
+      // it on the same Redis connection, so exactly one batch must exist.
+      await sentinelClient.publish(channel, sentinel);
+      await tap.waitFor((entry) => entry.message === sentinel);
+
+      const seatMessages = tap.messages.filter((entry) => entry.message !== sentinel);
+
+      expect(seatMessages).toHaveLength(1);
+    } finally {
       wireTap.disconnect();
       sentinelClient.disconnect();
     }

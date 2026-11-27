@@ -27,6 +27,9 @@ const PUBSUB_CLIENT_OPTIONS = {
   lazyConnect: true,
   enableOfflineQueue: false,
   maxRetriesPerRequest: 1,
+  // Explicit rather than relying on the library default: a reconnect must
+  // re-issue the subscriber's PSUBSCRIBE (D26) without application help.
+  autoResubscribe: true,
   retryStrategy: pubSubRetryStrategy,
 } as const;
 
