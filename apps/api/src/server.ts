@@ -1,6 +1,7 @@
 import { createApp } from "./app";
 import { loadConfig, type Config } from "./config";
 import { createPool } from "./db/pool";
+import { startExpireHoldsJob } from "./jobs/expireHolds";
 import { logger } from "./logger";
 import { createRedisClient } from "./realtime/redis";
 
@@ -20,6 +21,7 @@ function main(): void {
   const pool = createPool(config);
   const redis = createRedisClient(config);
   const app = createApp({ pool, redis });
+  const sweeperTimer = startExpireHoldsJob(pool, config, logger);
 
   const server = app.listen(PORT, () => {
     logger.info({ port: PORT }, "SeatSync API listening");
@@ -32,6 +34,7 @@ function main(): void {
 
   const shutdown = (signal: NodeJS.Signals): void => {
     logger.info({ signal }, "shutting down");
+    clearInterval(sweeperTimer);
     server.close(() => {
       const cleanup: Array<Promise<unknown>> = [pool.end()];
 

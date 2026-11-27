@@ -76,7 +76,7 @@ export default function EventsPage() {
             ← SeatSync home
           </Link>
           <h1 className="text-3xl font-bold tracking-tight">Published events</h1>
-          <p className="text-slate-600">Open an event to see its static seat grid.</p>
+          <p className="text-slate-600">Open an event to select seats and place a hold.</p>
         </div>
         <nav className="flex gap-3 text-sm">
           <Link href="/login" className="rounded-lg border border-slate-300 px-3 py-2">

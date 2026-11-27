@@ -116,6 +116,11 @@ export const SeatSchema = z.object({
   number: z.number().int().positive(),
   pricePaise: z.number().int(),
   status: SeatStatusSchema,
+  // D15: present only on the authenticated viewer's own active hold, so the
+  // web app can offer Release after a reload. Public reads omit them.
+  holdId: z.string().uuid().nullish(),
+  heldUntil: z.string().datetime({ offset: true }).nullish(),
+  heldByMe: z.boolean().optional(),
 });
 
 export type Seat = z.infer<typeof SeatSchema>;
@@ -132,3 +137,17 @@ export const PaginatedEventsResponseSchema = z.object({
 });
 
 export type PaginatedEventsResponse = z.infer<typeof PaginatedEventsResponseSchema>;
+
+export const HoldRequestSchema = z.object({
+  seatIds: z.array(z.string().uuid()),
+});
+
+export type HoldRequest = z.infer<typeof HoldRequestSchema>;
+
+export const HoldResponseSchema = z.object({
+  holdId: z.string().uuid(),
+  seatIds: z.array(z.string().uuid()),
+  heldUntil: z.string().datetime({ offset: true }),
+});
+
+export type HoldResponse = z.infer<typeof HoldResponseSchema>;

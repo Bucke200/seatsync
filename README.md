@@ -95,6 +95,21 @@ docker compose up -d
 
 Open http://localhost:3000/signup, register as an **Organizer**, create an event with a seat layout, publish it, then browse http://localhost:3000/events. Registering as an **Attendee** and opening an event shows its seat grid. The same endpoints are available from `curl.exe` against `http://localhost:4000`.
 
+## Sprint 2 — Seat holds
+
+Sprint 2 adds seat holds on top of the Sprint 1 event flow:
+
+- **Lock-then-update:** `POST /events/:id/holds` runs Rule 1 in one Postgres transaction: it locks the requested seats in deterministic ID order (`ORDER BY id FOR UPDATE`), then conditionally updates only rows that are `AVAILABLE` or whose hold has expired. If fewer rows come back than requested, the transaction rolls back and returns `409 SEATS_UNAVAILABLE` with `details.seatIds`; any number of concurrent requests for the same seat therefore produce exactly one hold.
+- **Endpoints:** `POST /events/:id/holds` requires a Bearer token, a published event and an `Idempotency-Key` header; its body is `{ seatIds }` (1 to `MAX_SEATS_PER_HOLD`, default 6) and it returns `201 { holdId, seatIds, heldUntil }`, where the hold lasts `HOLD_TTL_SECONDS` (default 600). `DELETE /holds/:id` is holder-only and returns `204` after setting the seats back to `AVAILABLE`.
+- **Validation:** `seatIds` must be unique UUIDs; empty, duplicate or malformed arrays return `422 VALIDATION_ERROR`, more than the maximum returns `422 TOO_MANY_SEATS`, and unknown or foreign seats return `409 SEATS_UNAVAILABLE`. A second active hold by the same user for the same event returns `409 SEATS_UNAVAILABLE` with the seats already held, and a missing or draft event returns `404 EVENT_NOT_FOUND`.
+- **Idempotency:** the same key with the same body and user replays the stored `201` or `409` verbatim and creates one hold; the same key with a different body or from a different user returns `422`, and a missing or blank header returns `400`. Keys are claimed with `INSERT ... ON CONFLICT DO NOTHING` and then read under `FOR UPDATE`, never check-then-insert.
+- **Sweeper:** `expireHolds` runs every `SWEEPER_INTERVAL_SECONDS` (default 30), selects expired holds with `ORDER BY id FOR UPDATE SKIP LOCKED` so it never blocks or deadlocks against the hold or confirm paths, clears the hold columns with `version = version + 1`, and prunes `idempotency_keys` (and `processed_webhooks` once Sprint 3 creates it) older than `RETENTION_DAYS` (default 30).
+- **Expired-hold reads:** seat reads, including `GET /events/:id`, treat a `HELD` seat whose `held_until` has passed as `AVAILABLE` using the database clock, so an expired hold never looks taken before the sweeper clears it.
+- **Tests:** six acceptance suites cover the race (200 concurrent holds on one seat → one `201`, 199×`409`, exactly one `HELD` row), overlapping holds, expiry including one sweeper run, idempotency, the Rule 3 `23505` backstop for confirmed bookings and `seatEvents` emission (nothing on rollback, once after `COMMIT`, per-seat versions).
+- **Web:** `/events/[id]` lets a signed-in attendee select seats, hold them and count down to `heldUntil`; Release returns them immediately, and a `409` lists the seats that were taken.
+
+Try it: open http://localhost:3000/events as an attendee, choose a published event and select up to six seats — **Hold seats** starts the countdown and **Release** returns them immediately.
+
 ## CI
 
 `.github/workflows/ci.yml` runs on every push (all branches) and on pull requests. A single Ubuntu job uses Node.js 22 and pnpm 10.8.1, with `postgres:16` and `redis:7` service containers, then runs `pnpm install --frozen-lockfile`, `pnpm lint`, `pnpm typecheck`, `pnpm --filter api migrate up`, `pnpm --filter api migrate down`, `pnpm --filter api migrate up` and `pnpm test`. CI uses the standard Postgres port 5432 because the hosted runner is clean; local development uses 5434 (see below).
