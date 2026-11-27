@@ -2,9 +2,11 @@ import cookieParser from "cookie-parser";
 import express, { type Express } from "express";
 import type { Redis } from "ioredis";
 import type { Pool } from "pg";
+import swaggerUi from "swagger-ui-express";
 import { loadConfig, type Config } from "./config";
 import { errorHandler } from "./middleware/errors";
 import { requestIdMiddleware } from "./middleware/requestId";
+import { generateOpenApiDocument } from "./openapi";
 import { createAuthRouter } from "./routes/auth";
 import { createEventsRouter } from "./routes/events";
 import { createHealthRouter } from "./routes/health";
@@ -34,6 +36,20 @@ export function createApp({
   app.use("/health", createHealthRouter({ pool, redis }));
   app.use("/auth", createAuthRouter(pool, config));
   app.use("/events", createEventsRouter(pool, config));
+
+  const openApiDocument = generateOpenApiDocument();
+  const swaggerHtml = swaggerUi.generateHTML(openApiDocument);
+
+  app.get("/docs.json", (_req, res) => {
+    res.json(openApiDocument);
+  });
+  // Serve /docs (no trailing slash) directly so Swagger UI answers 200 instead
+  // of swaggerUi.serve redirecting to /docs/ with a 301.
+  app.get("/docs", (_req, res) => {
+    res.type("html").send(swaggerHtml);
+  });
+  app.use("/docs", swaggerUi.serve, swaggerUi.setup(openApiDocument));
+
   app.use(errorHandler);
 
   return app;
