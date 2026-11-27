@@ -19,6 +19,11 @@ COPY packages/shared/package.json packages/shared/package.json
 RUN pnpm install --frozen-lockfile --filter web...
 
 FROM base AS builder
+# Next evaluates rewrites() at build time and bakes the destination into
+# routes-manifest.json, so the in-network API target must be present here, not
+# only at runtime.
+ARG API_PROXY_TARGET=http://localhost:4000
+ENV API_PROXY_TARGET=$API_PROXY_TARGET
 COPY --from=deps /app/node_modules ./node_modules
 COPY --from=deps /app/apps/web/node_modules ./apps/web/node_modules
 COPY --from=deps /app/packages/shared ./packages/shared

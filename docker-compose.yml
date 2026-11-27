@@ -78,6 +78,14 @@ services:
     build:
       context: .
       dockerfile: apps/web/Dockerfile
+      args:
+        # Next bakes rewrite destinations at build time (see apps/web/Dockerfile).
+        API_PROXY_TARGET: http://api:4000
+    environment:
+      # Next.js proxies /api/* here. Inside compose, localhost:4000 is the web
+      # container itself; host-run `next dev` uses the localhost default in
+      # next.config.mjs instead.
+      API_PROXY_TARGET: http://api:4000
     ports:
       - "3000:3000"
     depends_on:
