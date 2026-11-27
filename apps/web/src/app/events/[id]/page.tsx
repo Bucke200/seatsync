@@ -4,7 +4,7 @@ import type { ErrorResponse, EventDetail, EventStatus, Seat, SeatStatus } from "
 import Link from "next/link";
 import { useParams } from "next/navigation";
 import { useCallback, useEffect, useState } from "react";
-import { createHold, getEvent, releaseHold } from "@/lib/api";
+import { createCheckout, createHold, getEvent, releaseHold } from "@/lib/api";
 import { formatDateTime, formatPaise } from "@/lib/format";
 
 /**
@@ -154,6 +154,7 @@ export default function EventDetailPage() {
   const [unavailableSeatIds, setUnavailableSeatIds] = useState<string[]>([]);
   const [submitting, setSubmitting] = useState(false);
   const [releasing, setReleasing] = useState(false);
+  const [paying, setPaying] = useState(false);
   const [now, setNow] = useState(() => Date.now());
 
   const refreshEvent = useCallback(async (): Promise<void> => {
@@ -314,6 +315,27 @@ export default function EventDetailPage() {
     }
   }
 
+  async function handlePay(): Promise<void> {
+    if (activeHold === null || paying || holdExpired) {
+      return;
+    }
+
+    setPaying(true);
+    setHoldError(null);
+    setUnavailableSeatIds([]);
+
+    try {
+      const checkout = await createCheckout(activeHold.holdId);
+
+      // Fake URLs are same-origin paths; Razorpay's are absolute. Both work
+      // with a full navigation.
+      window.location.href = checkout.checkoutUrl;
+    } catch (err) {
+      setHoldError(messageFor(err));
+      setPaying(false);
+    }
+  }
+
   const unavailableLabels = unavailableSeatIds.map(labelForSeatId);
 
   return (
@@ -383,14 +405,24 @@ export default function EventDetailPage() {
                   Expires {formatDateTime(activeHold.heldUntil)}
                 </p>
               </div>
-              <button
-                type="button"
-                onClick={() => void handleRelease()}
-                disabled={releasing}
-                className="rounded-lg border border-blue-300 bg-white px-4 py-2 text-sm font-medium text-blue-900 transition hover:bg-blue-100 disabled:cursor-not-allowed disabled:opacity-50"
-              >
-                {releasing ? "Releasing…" : "Release hold"}
-              </button>
+              <div className="flex flex-wrap items-center gap-2">
+                <button
+                  type="button"
+                  onClick={() => void handlePay()}
+                  disabled={paying || holdExpired}
+                  className="rounded-lg bg-blue-700 px-5 py-2 text-sm font-medium text-white transition hover:bg-blue-800 disabled:cursor-not-allowed disabled:opacity-50"
+                >
+                  {paying ? "Starting checkout…" : "Pay"}
+                </button>
+                <button
+                  type="button"
+                  onClick={() => void handleRelease()}
+                  disabled={releasing}
+                  className="rounded-lg border border-blue-300 bg-white px-4 py-2 text-sm font-medium text-blue-900 transition hover:bg-blue-100 disabled:cursor-not-allowed disabled:opacity-50"
+                >
+                  {releasing ? "Releasing…" : "Release hold"}
+                </button>
+              </div>
             </section>
           ) : null}
 

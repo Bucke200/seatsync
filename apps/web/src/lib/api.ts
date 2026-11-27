@@ -1,19 +1,25 @@
 import {
   AuthResponseSchema,
+  BookingDetailSchema,
+  CheckoutResponseSchema,
   ErrorResponseSchema,
   EventDetailSchema,
   EventSummarySchema,
   HoldResponseSchema,
+  MeBookingsResponseSchema,
   PaginatedEventsResponseSchema,
 } from "@seatsync/shared";
 import type {
   AuthResponse,
+  BookingDetail,
+  CheckoutResponse,
   CreateEventRequest,
   ErrorResponse,
   EventDetail,
   EventSummary,
   HoldResponse,
   LoginRequest,
+  MeBookingsResponse,
   PaginatedEventsResponse,
   SignupRequest,
 } from "@seatsync/shared";
@@ -227,4 +233,32 @@ export async function createHold(
 
 export async function releaseHold(holdId: string): Promise<void> {
   await requestJson(`/api/holds/${encodeURIComponent(holdId)}`, { method: "DELETE", auth: true });
+}
+
+/**
+ * Start (or replay) checkout for the caller's hold. `requestJson` throws
+ * `ApiClientError` for every non-2xx response, so a 401/403/404 keeps its API
+ * envelope while a successful 200/201 parses to `{ bookingId, checkoutUrl }`.
+ */
+export async function createCheckout(holdId: string): Promise<CheckoutResponse> {
+  const payload = await requestJson(`/api/holds/${encodeURIComponent(holdId)}/checkout`, {
+    method: "POST",
+    auth: true,
+  });
+
+  return parseResponse(CheckoutResponseSchema, payload);
+}
+
+/** Owner-only booking detail; a foreign booking is a 403, a missing one a 404. */
+export async function getBooking(id: string): Promise<BookingDetail> {
+  const payload = await requestJson(`/api/bookings/${encodeURIComponent(id)}`, { auth: true });
+
+  return parseResponse(BookingDetailSchema, payload);
+}
+
+/** The caller's bookings, newest first. */
+export async function listMyBookings(): Promise<MeBookingsResponse> {
+  const payload = await requestJson("/api/me/bookings", { auth: true });
+
+  return parseResponse(MeBookingsResponseSchema, payload);
 }

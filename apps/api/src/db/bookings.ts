@@ -369,8 +369,9 @@ export async function processWebhookEvent(
 
     // Rule 2 lock (design.md:143-147): when the event carries a hold id, the
     // hold binding is part of the lock predicate, so a mismatched payload
-    // locks 0 rows and commits as a no-op. The fake provider permits events
-    // without holdId (doc-unspecified), and those lock by booking id alone.
+    // locks 0 rows and commits as a no-op. Provider events without holdId
+    // (razorpay returns undefined when the payment-link notes lack or malform
+    // it; doc-unspecified) lock by booking id alone.
     const locked =
       event.holdId === undefined
         ? await client.query<WebhookBookingRow>(
