@@ -6,6 +6,7 @@ import { loadConfig, type Config } from "./config";
 import { errorHandler } from "./middleware/errors";
 import { requestIdMiddleware } from "./middleware/requestId";
 import { createAuthRouter } from "./routes/auth";
+import { createEventsRouter } from "./routes/events";
 import { createHealthRouter } from "./routes/health";
 
 export interface AppDependencies {
@@ -32,6 +33,7 @@ export function createApp({
   app.use(cookieParser());
   app.use("/health", createHealthRouter({ pool, redis }));
   app.use("/auth", createAuthRouter(pool, config));
+  app.use("/events", createEventsRouter(pool, config));
   app.use(errorHandler);
 
   return app;
