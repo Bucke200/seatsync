@@ -1,5 +1,5 @@
 import { createApp } from "./app";
-import { loadConfig } from "./config";
+import { loadConfig, type Config } from "./config";
 import { createPool } from "./db/pool";
 import { logger } from "./logger";
 import { createRedisClient } from "./realtime/redis";
@@ -7,7 +7,7 @@ import { createRedisClient } from "./realtime/redis";
 const PORT = 4000;
 
 function main(): void {
-  let config;
+  let config: Config;
 
   try {
     config = loadConfig();
@@ -33,10 +33,19 @@ function main(): void {
   const shutdown = (signal: NodeJS.Signals): void => {
     logger.info({ signal }, "shutting down");
     server.close(() => {
-      void Promise.allSettled([pool.end(), redis.quit()]).then(() => {
-        process.exit(0);
+      const cleanup: Array<Promise<unknown>> = [pool.end()];
+
+      if (redis.status !== "wait" && redis.status !== "end") {
+        cleanup.push(redis.quit());
+      }
+
+      void Promise.allSettled(cleanup).then(() => {
+        logger.flush(() => {
+          process.exit(0);
+        });
       });
     });
+    server.closeIdleConnections();
   };
 
   process.once("SIGINT", shutdown);

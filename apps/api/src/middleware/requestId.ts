@@ -28,8 +28,14 @@ export function requestIdMiddleware(req: Request, res: Response, next: NextFunct
   res.setHeader("X-Request-Id", requestId);
 
   const startedAt = performance.now();
+  let logged = false;
 
-  res.once("finish", () => {
+  const logRequest = (): void => {
+    if (logged) {
+      return;
+    }
+
+    logged = true;
     req.log.info(
       {
         method: req.method,
@@ -39,7 +45,12 @@ export function requestIdMiddleware(req: Request, res: Response, next: NextFunct
       },
       "request completed",
     );
-  });
+  };
+
+  // "finish" fires for responses written to the client; "close" also covers
+  // aborted or destroyed connections. The guard keeps it to one line per request.
+  res.once("finish", logRequest);
+  res.once("close", logRequest);
 
   next();
 }

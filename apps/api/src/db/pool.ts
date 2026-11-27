@@ -11,6 +11,8 @@ export function createPool(config: Config, log: Logger = logger): Pool {
   const pool = new Pool({
     connectionString: config.DATABASE_URL,
     max: config.DB_POOL_SIZE,
+    // Bound health-check and first-query latency when Postgres is black-holed.
+    connectionTimeoutMillis: 10_000,
   });
 
   pool.on("error", (error) => {
