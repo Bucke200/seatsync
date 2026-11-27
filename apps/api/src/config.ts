@@ -15,34 +15,65 @@ const paymentProviderSchema = z.enum(["stripe", "razorpay", "fake"]);
 const positiveInteger = (fallback: number) =>
   z.coerce.number().int().positive().default(fallback);
 
-const configSchema = z.object({
-  DATABASE_URL: z.string().min(1, "must not be empty"),
-  REDIS_URL: z.string().min(1, "must not be empty"),
-  DB_POOL_SIZE: positiveInteger(20),
-  JWT_SECRET: z.string().min(1, "must not be empty"),
-  ACCESS_TOKEN_TTL_SECONDS: positiveInteger(900),
-  REFRESH_TOKEN_TTL_SECONDS: positiveInteger(1_209_600),
-  HOLD_TTL_SECONDS: positiveInteger(600),
-  SWEEPER_INTERVAL_SECONDS: positiveInteger(30),
-  MAX_SEATS_PER_HOLD: positiveInteger(6),
-  PAYMENT_PROVIDER: paymentProviderSchema.default("fake"),
-  PAYMENT_WEBHOOK_SECRET: z.string().min(1, "must not be empty"),
-  HOLDS_RATE_LIMIT_PER_MINUTE: positiveInteger(20),
-  CORS_ORIGINS: z
-    .string()
-    .default(DEFAULT_CORS_ORIGINS)
-    .transform((value) =>
-      value
-        .split(",")
-        .map((origin) => origin.trim())
-        .filter((origin) => origin.length > 0),
-    )
-    .refine((origins) => origins.length > 0, {
-      message: "must contain at least one origin",
-    }),
-  LIVE_UPDATE_MAX_MS: positiveInteger(1_000),
-  RETENTION_DAYS: positiveInteger(30),
-});
+const configSchema = z
+  .object({
+    DATABASE_URL: z.string().min(1, "must not be empty"),
+    REDIS_URL: z.string().min(1, "must not be empty"),
+    DB_POOL_SIZE: positiveInteger(20),
+    JWT_SECRET: z.string().min(1, "must not be empty"),
+    ACCESS_TOKEN_TTL_SECONDS: positiveInteger(900),
+    REFRESH_TOKEN_TTL_SECONDS: positiveInteger(1_209_600),
+    HOLD_TTL_SECONDS: positiveInteger(600),
+    SWEEPER_INTERVAL_SECONDS: positiveInteger(30),
+    MAX_SEATS_PER_HOLD: positiveInteger(6),
+    PAYMENT_PROVIDER: paymentProviderSchema.default("fake"),
+    PAYMENT_WEBHOOK_SECRET: z.string().min(1, "must not be empty"),
+    /**
+     * Razorpay API credentials (D19). Optional for every other provider and
+     * required only when PAYMENT_PROVIDER=razorpay, enforced by the
+     * superRefine below so the fake provider stays usable without sandbox keys.
+     */
+    RAZORPAY_KEY_ID: z.string().min(1, "must not be empty").optional(),
+    RAZORPAY_KEY_SECRET: z.string().min(1, "must not be empty").optional(),
+    HOLDS_RATE_LIMIT_PER_MINUTE: positiveInteger(20),
+    CORS_ORIGINS: z
+      .string()
+      .default(DEFAULT_CORS_ORIGINS)
+      .transform((value) =>
+        value
+          .split(",")
+          .map((origin) => origin.trim())
+          .filter((origin) => origin.length > 0),
+      )
+      .refine((origins) => origins.length > 0, {
+        message: "must contain at least one origin",
+      }),
+    LIVE_UPDATE_MAX_MS: positiveInteger(1_000),
+    RETENTION_DAYS: positiveInteger(30),
+  })
+  .superRefine((config, ctx) => {
+    if (config.PAYMENT_PROVIDER !== "razorpay") {
+      return;
+    }
+
+    // `normalizeEnv` drops blank values, so undefined here also covers "" and
+    // whitespace-only input.
+    if (config.RAZORPAY_KEY_ID === undefined) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["RAZORPAY_KEY_ID"],
+        message: "is required when PAYMENT_PROVIDER is razorpay",
+      });
+    }
+
+    if (config.RAZORPAY_KEY_SECRET === undefined) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["RAZORPAY_KEY_SECRET"],
+        message: "is required when PAYMENT_PROVIDER is razorpay",
+      });
+    }
+  });
 
 export type PaymentProvider = z.infer<typeof paymentProviderSchema>;
 export type Config = z.infer<typeof configSchema>;

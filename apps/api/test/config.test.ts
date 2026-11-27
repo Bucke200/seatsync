@@ -38,6 +38,61 @@ describe("loadConfig", () => {
     expect(config.CORS_ORIGINS).toEqual(["http://localhost:3000"]);
   });
 
+  it("defaults to the fake provider with no Razorpay keys", () => {
+    const config = loadConfig({ ...REQUIRED_ENV });
+
+    expect(config.PAYMENT_PROVIDER).toBe("fake");
+    expect(config.RAZORPAY_KEY_ID).toBeUndefined();
+    expect(config.RAZORPAY_KEY_SECRET).toBeUndefined();
+  });
+
+  it("requires both Razorpay keys when the provider is razorpay", () => {
+    const message = configErrorMessage({
+      ...REQUIRED_ENV,
+      PAYMENT_PROVIDER: "razorpay",
+    });
+
+    expect(message).toContain("RAZORPAY_KEY_ID");
+    expect(message).toContain("RAZORPAY_KEY_SECRET");
+    expect(message).toContain("required when PAYMENT_PROVIDER is razorpay");
+  });
+
+  it("requires the Razorpay key secret when only the key id is set", () => {
+    const message = configErrorMessage({
+      ...REQUIRED_ENV,
+      PAYMENT_PROVIDER: "razorpay",
+      RAZORPAY_KEY_ID: "rzp_test_key_id",
+    });
+
+    expect(message).toContain("RAZORPAY_KEY_SECRET");
+    expect(message).not.toContain("RAZORPAY_KEY_ID");
+  });
+
+  it("treats a blank Razorpay key as missing", () => {
+    const message = configErrorMessage({
+      ...REQUIRED_ENV,
+      PAYMENT_PROVIDER: "razorpay",
+      RAZORPAY_KEY_ID: "   ",
+      RAZORPAY_KEY_SECRET: "rzp_test_key_secret",
+    });
+
+    expect(message).toContain("RAZORPAY_KEY_ID");
+    expect(message).not.toContain("RAZORPAY_KEY_SECRET");
+  });
+
+  it("accepts the razorpay provider when both keys are set", () => {
+    const config = loadConfig({
+      ...REQUIRED_ENV,
+      PAYMENT_PROVIDER: "razorpay",
+      RAZORPAY_KEY_ID: "rzp_test_key_id",
+      RAZORPAY_KEY_SECRET: "rzp_test_key_secret",
+    });
+
+    expect(config.PAYMENT_PROVIDER).toBe("razorpay");
+    expect(config.RAZORPAY_KEY_ID).toBe("rzp_test_key_id");
+    expect(config.RAZORPAY_KEY_SECRET).toBe("rzp_test_key_secret");
+  });
+
   it("rejects an unknown payment provider", () => {
     expect(() => loadConfig({ ...REQUIRED_ENV, PAYMENT_PROVIDER: "paypal" })).toThrow(
       /PAYMENT_PROVIDER/,
