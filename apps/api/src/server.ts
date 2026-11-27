@@ -5,7 +5,8 @@ import { startExpireHoldsJob } from "./jobs/expireHolds";
 import { startRetryRefundsJob } from "./jobs/retryRefunds";
 import { logger } from "./logger";
 import { createPaymentProvider } from "./payments";
-import { createRedisClient } from "./realtime/redis";
+import { createPubSubClients, createRedisClient } from "./realtime/redis";
+import { attachRealtimeServer } from "./realtime/ws";
 
 const PORT = 4000;
 
@@ -44,6 +45,12 @@ function main(): void {
     logger.info({ port: PORT }, "SeatSync API listening");
   });
 
+  // D28: the WebSocket server shares the HTTP listen socket at `/ws`. Step 2
+  // wires the pub/sub clients to this hub; both are created here so their
+  // lifecycle and the shutdown order live in one place.
+  const realtime = attachRealtimeServer(server, { config });
+  const pubsub = createPubSubClients(config);
+
   server.on("error", (error) => {
     logger.fatal({ err: error }, "HTTP server error");
     process.exitCode = 1;
@@ -55,8 +62,18 @@ function main(): void {
     if (refundTimer !== null) {
       clearInterval(refundTimer);
     }
+
+    // Shutdown order: stop accepting new sockets and terminate live WebSocket
+    // connections first, then let the HTTP server drain, then close Redis
+    // (pub/sub included). Both pub/sub clients were never subscribed in step 1
+    // and `disconnect()` is safe even from `wait`/`reconnecting`.
+    const realtimeClosed = realtime.close();
+
     server.close(() => {
-      const cleanup: Array<Promise<unknown>> = [pool.end()];
+      const cleanup: Array<Promise<unknown>> = [realtimeClosed, pool.end()];
+
+      pubsub.publisher.disconnect();
+      pubsub.subscriber.disconnect();
 
       if (redis.status !== "wait" && redis.status !== "end") {
         cleanup.push(redis.quit());

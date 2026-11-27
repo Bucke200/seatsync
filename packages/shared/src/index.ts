@@ -116,6 +116,10 @@ export const SeatSchema = z.object({
   number: z.number().int().positive(),
   pricePaise: z.number().int(),
   status: SeatStatusSchema,
+  // D29: per-seat version for the client's stale-message filter. `GET
+  // /events/:id` returns it, so a reconnecting client can rebuild its
+  // `Map<seatId, version>` snapshot before applying live WS updates.
+  version: z.number().int().nonnegative(),
   // D15: present only on the authenticated viewer's own active hold, so the
   // web app can offer Release after a reload. Public reads omit them.
   holdId: z.string().uuid().nullish(),
