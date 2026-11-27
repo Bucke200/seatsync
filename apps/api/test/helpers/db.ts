@@ -17,6 +17,7 @@ export const APPLICATION_TABLES = [
   "bookings",
   "booking_seats",
   "idempotency_keys",
+  "processed_webhooks",
 ] as const;
 
 /**

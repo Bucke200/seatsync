@@ -268,10 +268,12 @@ describe("holds expiry", () => {
 
       const summary = await runSweeperOnce(pool, config);
 
+      // Migration 0005 creates processed_webhooks, so the sweeper now prunes it
+      // (nothing to delete here) instead of skipping the absent table.
       expect(summary).toEqual({
         released: 1,
         prunedIdempotencyKeys: 0,
-        prunedWebhooks: null,
+        prunedWebhooks: 0,
       });
 
       const afterSweep = await readSeats(event.id);

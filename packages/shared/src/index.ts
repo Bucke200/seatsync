@@ -151,3 +151,68 @@ export const HoldResponseSchema = z.object({
 });
 
 export type HoldResponse = z.infer<typeof HoldResponseSchema>;
+
+export const BookingStatusSchema = z.enum([
+  "PENDING",
+  "CONFIRMED",
+  "FAILED",
+  "REFUNDED",
+]);
+
+export type BookingStatus = z.infer<typeof BookingStatusSchema>;
+
+export const CheckoutResponseSchema = z.object({
+  bookingId: z.string().uuid(),
+  checkoutUrl: z.string(),
+});
+
+export type CheckoutResponse = z.infer<typeof CheckoutResponseSchema>;
+
+/**
+ * A booking's seat as the booking detail returns it. Section/row/number and
+ * price come from the live `seats` row; `status` is that seat's current
+ * AVAILABLE / HELD / BOOKED state, not the booking-level status.
+ */
+export const BookingSeatViewSchema = z.object({
+  seatId: z.string().uuid(),
+  section: z.string(),
+  rowLabel: z.string(),
+  number: z.number().int().positive(),
+  status: SeatStatusSchema,
+  pricePaise: z.number().int(),
+});
+
+export type BookingSeatView = z.infer<typeof BookingSeatViewSchema>;
+
+export const BookingDetailSchema = z.object({
+  id: z.string().uuid(),
+  eventId: z.string().uuid(),
+  status: BookingStatusSchema,
+  amountPaise: z.number().int(),
+  paymentRef: z.string().nullable(),
+  checkoutUrl: z.string().nullable(),
+  holdId: z.string().uuid(),
+  createdAt: z.string().datetime({ offset: true }),
+  seats: z.array(BookingSeatViewSchema),
+});
+
+export type BookingDetail = z.infer<typeof BookingDetailSchema>;
+
+export const MeBookingsItemSchema = z.object({
+  id: z.string().uuid(),
+  eventId: z.string().uuid(),
+  eventTitle: z.string(),
+  eventStartsAt: z.string().datetime({ offset: true }),
+  status: BookingStatusSchema,
+  amountPaise: z.number().int(),
+  seatCount: z.number().int(),
+  createdAt: z.string().datetime({ offset: true }),
+});
+
+export type MeBookingsItem = z.infer<typeof MeBookingsItemSchema>;
+
+export const MeBookingsResponseSchema = z.object({
+  bookings: z.array(MeBookingsItemSchema),
+});
+
+export type MeBookingsResponse = z.infer<typeof MeBookingsResponseSchema>;

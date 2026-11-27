@@ -15,6 +15,12 @@ import {
   PaginatedEventsResponseSchema,
   HoldRequestSchema,
   HoldResponseSchema,
+  BookingStatusSchema,
+  CheckoutResponseSchema,
+  BookingSeatViewSchema,
+  BookingDetailSchema,
+  MeBookingsItemSchema,
+  MeBookingsResponseSchema,
 } from "@seatsync/shared";
 import {
   OpenAPIRegistry,
@@ -25,6 +31,29 @@ import { z } from "zod";
 
 const EventIdParamsSchema = z.object({ id: z.string().uuid() });
 const HoldIdParamsSchema = z.object({ id: z.string().uuid() });
+const BookingIdParamsSchema = z.object({ id: z.string().uuid() });
+const WebhookProviderParamsSchema = z.object({
+  provider: z.string().min(1),
+});
+const WebhookHeadersSchema = z.object({
+  "x-fake-signature": z.string().optional().openapi({
+    description:
+      "Hex HMAC-SHA256 of the exact raw body keyed by PAYMENT_WEBHOOK_SECRET. " +
+      "Required when PAYMENT_PROVIDER=fake.",
+  }),
+  "X-Razorpay-Signature": z.string().optional().openapi({
+    description:
+      "Razorpay's HMAC-SHA256 webhook signature header. Required when " +
+      "PAYMENT_PROVIDER=razorpay.",
+  }),
+});
+const WebhookBodySchema = z.object({}).passthrough().openapi({
+  description:
+    "The provider's JSON payload, delivered as raw bytes. The signature is " +
+    "computed over those exact bytes, so the API mounts a raw body parser on " +
+    "/webhooks before express.json().",
+});
+const WebhookReceivedResponseSchema = z.object({ received: z.boolean() });
 const IdempotencyKeyHeaderSchema = z.object({
   "Idempotency-Key": z
     .string()
@@ -75,6 +104,12 @@ export function generateOpenApiDocument() {
   registry.register("PaginatedEventsResponse", PaginatedEventsResponseSchema);
   registry.register("HoldRequest", HoldRequestSchema);
   registry.register("HoldResponse", HoldResponseSchema);
+  registry.register("BookingStatus", BookingStatusSchema);
+  registry.register("CheckoutResponse", CheckoutResponseSchema);
+  registry.register("BookingSeatView", BookingSeatViewSchema);
+  registry.register("BookingDetail", BookingDetailSchema);
+  registry.register("MeBookingsItem", MeBookingsItemSchema);
+  registry.register("MeBookingsResponse", MeBookingsResponseSchema);
 
   registry.registerComponent("securitySchemes", "bearerAuth", {
     type: "http",
@@ -313,6 +348,98 @@ export function generateOpenApiDocument() {
       401: errorResponse("Missing or invalid access token"),
       403: errorResponse("The authenticated user is not the holder"),
       404: errorResponse("Hold not found or already expired"),
+    },
+  });
+
+  registry.registerPath({
+    method: "post",
+    path: "/holds/{id}/checkout",
+    tags: ["payments"],
+    summary: "Create a PENDING booking for a held set of seats",
+    description:
+      "Holder-only. A first call creates the PENDING booking and its " +
+      "booking_seats, calls the configured provider and returns its checkout " +
+      "URL with 201. A second call for the same hold replays the stored " +
+      "booking with 200 and does not call the provider again.",
+    security: [{ bearerAuth: [] }],
+    request: {
+      params: HoldIdParamsSchema,
+    },
+    responses: {
+      201: jsonResponse("New PENDING booking and its checkout URL", CheckoutResponseSchema),
+      200: jsonResponse("Existing booking for this hold replayed", CheckoutResponseSchema),
+      400: errorResponse("Hold id is not a UUID"),
+      401: errorResponse("Missing or invalid access token"),
+      403: errorResponse("The authenticated user is not the holder"),
+      404: errorResponse("Hold not found or already expired"),
+      502: errorResponse("Payment provider failed to create a checkout"),
+    },
+  });
+
+  registry.registerPath({
+    method: "post",
+    path: "/webhooks/{provider}",
+    tags: ["payments"],
+    summary: "Receive a payment provider webhook",
+    description:
+      "The provider authenticates the delivery with an HMAC over the exact raw " +
+      "body, so no bearer token is used. Signature headers: " +
+      "`x-fake-signature` for the fake provider and `X-Razorpay-Signature` for " +
+      "Razorpay. The `provider` path segment must equal PAYMENT_PROVIDER. " +
+      "Duplicate events and already-terminal bookings are acknowledged with " +
+      "200; a bad signature or unknown provider returns 400 before any DB work.",
+    request: {
+      params: WebhookProviderParamsSchema,
+      headers: WebhookHeadersSchema,
+      body: {
+        required: true,
+        content: { "application/json": { schema: WebhookBodySchema } },
+      },
+    },
+    responses: {
+      200: jsonResponse(
+        "Delivery processed, already processed, or a no-op for a terminal booking",
+        WebhookReceivedResponseSchema,
+      ),
+      400: errorResponse(
+        "Invalid signature, malformed body, or provider not configured",
+      ),
+    },
+  });
+
+  registry.registerPath({
+    method: "get",
+    path: "/bookings/{id}",
+    tags: ["bookings"],
+    summary: "Get one of the authenticated user's bookings",
+    description:
+      "Owner only. The response carries the booking status, amount, payment " +
+      "reference, checkout URL and every booked seat with its live seat status.",
+    security: [{ bearerAuth: [] }],
+    request: {
+      params: BookingIdParamsSchema,
+    },
+    responses: {
+      200: jsonResponse("The booking with its seats", BookingDetailSchema),
+      400: errorResponse("Booking id is not a UUID"),
+      401: errorResponse("Missing or invalid access token"),
+      403: errorResponse("The booking belongs to another user"),
+      404: errorResponse("Booking not found"),
+    },
+  });
+
+  registry.registerPath({
+    method: "get",
+    path: "/me/bookings",
+    tags: ["bookings"],
+    summary: "List the authenticated user's bookings newest-first",
+    security: [{ bearerAuth: [] }],
+    responses: {
+      200: jsonResponse(
+        "The caller's bookings with event title/start and seat count",
+        MeBookingsResponseSchema,
+      ),
+      401: errorResponse("Missing or invalid access token"),
     },
   });
 
