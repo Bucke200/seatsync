@@ -9,7 +9,7 @@ import type { Pool } from "pg";
  * documents dependencies (though `CASCADE` also follows foreign keys). When a
  * migration adds an application table, append it here.
  */
-export const APPLICATION_TABLES = ["users"] as const;
+export const APPLICATION_TABLES = ["users", "refresh_tokens", "events", "seats"] as const;
 
 /**
  * Empty every application table while keeping the schema intact.
