@@ -1,6 +1,6 @@
 # SeatSync — Project Plan & Sprint Breakdown
 
-Nov 27, 2026 · @shiven
+Nov 27, 2026 · @srinjay
 
 ## Overview
 
