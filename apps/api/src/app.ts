@@ -8,6 +8,7 @@ import { errorHandler } from "./middleware/errors";
 import { requestIdMiddleware } from "./middleware/requestId";
 import { generateOpenApiDocument } from "./openapi";
 import { createAuthRouter } from "./routes/auth";
+import { createBookingsRouter } from "./routes/bookings";
 import { createEventsRouter } from "./routes/events";
 import { createHealthRouter } from "./routes/health";
 import { createHoldsRouter } from "./routes/holds";
@@ -39,6 +40,8 @@ export function createApp({
   app.use("/events", createEventsRouter(pool, config));
   // Two prefixes under one router (`/events/{id}/holds`, `/holds/{id}`).
   app.use(createHoldsRouter(pool, config));
+  // `/holds/{id}/checkout` (Step 3); booking reads join this router in Step 5.
+  app.use(createBookingsRouter(pool, config));
 
   const openApiDocument = generateOpenApiDocument();
   const swaggerHtml = swaggerUi.generateHTML(openApiDocument);
