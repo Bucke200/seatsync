@@ -30,3 +30,6 @@ pnpm-debug.log*
 .idea/
 .DS_Store
 Thumbs.db
+
+# Agent tooling context (kept local, not shared)
+.opencode/
