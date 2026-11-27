@@ -1,0 +1,23 @@
+{
+  "name": "seatsync",
+  "version": "0.0.0",
+  "private": true,
+  "description": "SeatSync — event booking that never sells the same seat twice",
+  "packageManager": "pnpm@10.8.1",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "lint": "pnpm -r lint",
+    "typecheck": "pnpm -r typecheck",
+    "test": "pnpm -r test"
+  },
+  "devDependencies": {
+    "@eslint/js": "^9.18.0",
+    "eslint": "^9.18.0",
+    "globals": "^15.14.0",
+    "prettier": "^3.4.2",
+    "typescript": "^5.7.3",
+    "typescript-eslint": "^8.21.0"
+  }
+}
