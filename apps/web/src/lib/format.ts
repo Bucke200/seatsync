@@ -1,3 +1,5 @@
+import type { UserRole } from "@seatsync/shared";
+
 const dateTimeFormatter = new Intl.DateTimeFormat("en-IN", {
   dateStyle: "medium",
   timeStyle: "short",
@@ -17,4 +19,9 @@ export function formatDateTime(iso: string): string {
 /** Integer paise (the database unit) to an INR currency string. */
 export function formatPaise(paise: number): string {
   return paiseFormatter.format(paise / 100);
+}
+
+/** A `UserRole` as the label shown in the nav badge and profile card. */
+export function formatRole(role: UserRole): string {
+  return role === "ORGANIZER" ? "Organizer" : "Attendee";
 }

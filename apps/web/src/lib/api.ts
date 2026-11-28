@@ -23,9 +23,42 @@ import type {
   MeBookingsResponse,
   PaginatedEventsResponse,
   SignupRequest,
+  UserRole,
 } from "@seatsync/shared";
 
 const ACCESS_TOKEN_KEY = "seatsync.accessToken";
+const AUTH_USER_KEY = "seatsync.authUser";
+
+/**
+ * Same-tab broadcast fired whenever the stored session changes. The root nav
+ * and the profile page listen for it so a login, logout or token refresh
+ * re-renders the auth UI without a full page load.
+ */
+export const AUTH_CHANGE_EVENT = "seatsync:auth";
+
+/** The identity the web app can render for the signed-in user. */
+export interface AuthUser {
+  email: string;
+  role: UserRole;
+}
+
+/**
+ * The access token's JWT payload only signs `sub` and `role` (see
+ * `apps/api/src/services/auth.ts`), so `setAccessToken` opportunistically
+ * caches the email returned by login/signup. The cache carries the same `sub`
+ * and is only used while it still matches the token in storage.
+ */
+interface CachedAuthUser extends AuthUser {
+  sub: string | null;
+}
+
+function notifyAuthChange(): void {
+  if (typeof window === "undefined") {
+    return;
+  }
+
+  window.dispatchEvent(new CustomEvent(AUTH_CHANGE_EVENT));
+}
 
 /** Errors surfaced by the API, carrying its machine-readable code. */
 export class ApiClientError extends Error {
@@ -49,12 +82,36 @@ export function getAccessToken(): string | null {
   return window.sessionStorage.getItem(ACCESS_TOKEN_KEY);
 }
 
-export function setAccessToken(token: string): void {
+/**
+ * Store an access token and, when the caller has it, the identity returned by
+ * login/signup. The optional identity is only used for the email, which the
+ * signed JWT does not carry; the role is read from the token itself.
+ *
+ * Always dispatches `AUTH_CHANGE_EVENT` (guarded for the server) so the nav
+ * re-renders after every login, logout and transparent refresh.
+ */
+export function setAccessToken(token: string, user?: AuthUser): void {
   if (typeof window === "undefined") {
     return;
   }
 
   window.sessionStorage.setItem(ACCESS_TOKEN_KEY, token);
+
+  if (user !== undefined) {
+    const cached: CachedAuthUser = { sub: jwtSubject(token), email: user.email, role: user.role };
+    window.sessionStorage.setItem(AUTH_USER_KEY, JSON.stringify(cached));
+  } else {
+    const cached = readCachedAuthUser();
+
+    // A refreshed token for a different `sub` must not inherit another user's
+    // email. The identity guard in `requestJson` normally prevents that path;
+    // this is the cheap storage-level backstop.
+    if (cached !== null && cached.sub !== jwtSubject(token)) {
+      window.sessionStorage.removeItem(AUTH_USER_KEY);
+    }
+  }
+
+  notifyAuthChange();
 }
 
 export function clearAccessToken(): void {
@@ -63,22 +120,55 @@ export function clearAccessToken(): void {
   }
 
   window.sessionStorage.removeItem(ACCESS_TOKEN_KEY);
+  window.sessionStorage.removeItem(AUTH_USER_KEY);
+  notifyAuthChange();
+}
+
+function readCachedAuthUser(): CachedAuthUser | null {
+  if (typeof window === "undefined") {
+    return null;
+  }
+
+  const raw = window.sessionStorage.getItem(AUTH_USER_KEY);
+
+  if (raw === null) {
+    return null;
+  }
+
+  try {
+    const parsed: unknown = JSON.parse(raw);
+
+    if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+      return null;
+    }
+
+    const record = parsed as Record<string, unknown>;
+    const role = record.role;
+
+    if (typeof record.email !== "string" || (role !== "ORGANIZER" && role !== "ATTENDEE")) {
+      return null;
+    }
+
+    return {
+      sub: typeof record.sub === "string" ? record.sub : null,
+      email: record.email,
+      role,
+    };
+  } catch {
+    return null;
+  }
 }
 
 /**
- * Read the `sub` claim out of an access token's payload. This is NOT signature
- * verification — the API already owns that — it only compares the identity a
- * request was sent with against the identity a refresh handed back. Tokens are
- * base64url-encoded JWT segments, so `atob` needs the URL alphabet mapped back
- * and the padding restored. `atob` yields latin1 bytes, so the payload goes
- * through `TextDecoder` before `JSON.parse`; a non-ASCII `sub` must not decode
- * to mojibake and misfire the guard. Any malformed input yields `null`
- * (unknown identity).
- *
- * Shared with the event page's WebSocket identity guard, which reloads instead
- * of adopting a different user's token.
+ * Decode a JWT payload without verifying its signature. The API owns
+ * verification; the web app only needs the claims it renders and the identity
+ * comparisons that guard token refreshes. Tokens are base64url-encoded JWT
+ * segments, so `atob` needs the URL alphabet mapped back and the padding
+ * restored. `atob` yields latin1 bytes, so the payload goes through
+ * `TextDecoder` before `JSON.parse`; non-ASCII claims must not decode to
+ * mojibake. Malformed input yields `null`.
  */
-export function jwtSubject(token: string): string | null {
+function decodeJwtPayload(token: string): Record<string, unknown> | null {
   const payload = token.split(".")[1];
 
   if (payload === undefined || payload.length === 0) {
@@ -95,12 +185,68 @@ export function jwtSubject(token: string): string | null {
       return null;
     }
 
-    const subject = (parsed as { sub?: unknown }).sub;
-
-    return typeof subject === "string" ? subject : null;
+    return parsed as Record<string, unknown>;
   } catch {
     return null;
   }
+}
+
+/**
+ * Read the `sub` claim out of an access token's payload. This is NOT signature
+ * verification — the API already owns that — it only compares the identity a
+ * request was sent with against the identity a refresh handed back. Any
+ * malformed input yields `null` (unknown identity).
+ *
+ * Shared with the event page's WebSocket identity guard, which reloads instead
+ * of adopting a different user's token.
+ */
+export function jwtSubject(token: string): string | null {
+  const payload = decodeJwtPayload(token);
+
+  if (payload === null) {
+    return null;
+  }
+
+  return typeof payload.sub === "string" ? payload.sub : null;
+}
+
+/**
+ * The signed-in user for the nav and profile card, or `null` when there is no
+ * usable token. Uses the JWT for `role`/`email` when present; this API's tokens
+ * carry `sub` + `role` only, so the email comes from the login/signup cache
+ * written by `setAccessToken`, matched on `sub`.
+ */
+export function getAuthUser(): AuthUser | null {
+  const token = getAccessToken();
+
+  if (token === null) {
+    return null;
+  }
+
+  const payload = decodeJwtPayload(token);
+
+  if (payload === null) {
+    return null;
+  }
+
+  const role = payload.role;
+
+  if (role !== "ORGANIZER" && role !== "ATTENDEE") {
+    return null;
+  }
+
+  let email = typeof payload.email === "string" ? payload.email : null;
+
+  if (email === null) {
+    const cached = readCachedAuthUser();
+    const subject = typeof payload.sub === "string" ? payload.sub : null;
+
+    if (cached !== null && cached.sub === subject) {
+      email = cached.email;
+    }
+  }
+
+  return email === null || email.length === 0 ? null : { email, role };
 }
 
 interface ResponseParser<T> {
@@ -114,6 +260,8 @@ interface RequestJsonOptions {
   headers?: Record<string, string>;
   /** Attach the stored Bearer token and recover it once via refresh on 401. */
   auth?: boolean;
+  /** Fetch credentials mode; logout needs the httpOnly refresh cookie. */
+  credentials?: RequestCredentials;
 }
 
 function parseResponse<T>(schema: ResponseParser<T>, payload: unknown): T {
@@ -173,6 +321,7 @@ async function requestJson(
     headers,
     body: options.body === undefined ? undefined : JSON.stringify(options.body),
     cache: "no-store",
+    credentials: options.credentials ?? "same-origin",
   });
 
   if (!response.ok) {
@@ -283,6 +432,20 @@ export async function login(input: LoginRequest): Promise<AuthResponse> {
   return parseResponse(AuthResponseSchema, payload);
 }
 
+/**
+ * Revoke the current refresh token and clear its cookie. The Bearer token
+ * identifies the user so the API can revoke every refresh token they own;
+ * `credentials: "include"` makes sure the httpOnly cookie rides along so the
+ * exact token is revoked too. A 204 has no body.
+ */
+export async function logout(): Promise<void> {
+  await requestJson("/api/auth/logout", {
+    method: "POST",
+    auth: true,
+    credentials: "include",
+  });
+}
+
 export async function listPublishedEvents(
   limit: number,
   cursor: string | null,
@@ -329,8 +492,7 @@ export async function publishEvent(id: string): Promise<EventSummary> {
  * Every other non-2xx status still throws `ApiClientError`.
  */
 export type CreateHoldResult =
-  | { status: 201; body: HoldResponse }
-  | { status: 409; body: ErrorResponse };
+  { status: 201; body: HoldResponse } | { status: 409; body: ErrorResponse };
 
 /** D2: the caller generates a fresh Idempotency-Key per hold attempt. */
 export async function createHold(

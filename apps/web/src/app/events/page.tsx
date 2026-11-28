@@ -79,12 +79,6 @@ export default function EventsPage() {
           <p className="text-slate-600">Open an event to select seats and place a hold.</p>
         </div>
         <nav className="flex gap-3 text-sm">
-          <Link href="/login" className="rounded-lg border border-slate-300 px-3 py-2">
-            Log in
-          </Link>
-          <Link href="/signup" className="rounded-lg border border-slate-300 px-3 py-2">
-            Sign up
-          </Link>
           <Link
             href="/organizer/events/new"
             className="rounded-lg bg-slate-900 px-3 py-2 font-medium text-white"

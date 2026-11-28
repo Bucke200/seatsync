@@ -28,7 +28,7 @@ export default function LoginPage() {
 
     try {
       const session = await login(parsed.data);
-      setAccessToken(session.accessToken);
+      setAccessToken(session.accessToken, session.user);
       router.push(session.user.role === "ORGANIZER" ? "/organizer/events/new" : "/events");
     } catch (err) {
       setError(err instanceof ApiClientError ? err.message : "Login failed. Please try again.");
@@ -38,7 +38,7 @@ export default function LoginPage() {
   }
 
   return (
-    <main className="flex min-h-screen items-center justify-center bg-slate-50 p-6">
+    <main className="flex min-h-[calc(100vh-4rem)] items-center justify-center bg-slate-50 p-6">
       <form
         onSubmit={(event) => void handleSubmit(event)}
         className="w-full max-w-md space-y-5 rounded-2xl border border-slate-200 bg-white p-8 shadow-sm"
