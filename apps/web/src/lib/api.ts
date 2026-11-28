@@ -65,6 +65,44 @@ export function clearAccessToken(): void {
   window.sessionStorage.removeItem(ACCESS_TOKEN_KEY);
 }
 
+/**
+ * Read the `sub` claim out of an access token's payload. This is NOT signature
+ * verification — the API already owns that — it only compares the identity a
+ * request was sent with against the identity a refresh handed back. Tokens are
+ * base64url-encoded JWT segments, so `atob` needs the URL alphabet mapped back
+ * and the padding restored. `atob` yields latin1 bytes, so the payload goes
+ * through `TextDecoder` before `JSON.parse`; a non-ASCII `sub` must not decode
+ * to mojibake and misfire the guard. Any malformed input yields `null`
+ * (unknown identity).
+ *
+ * Shared with the event page's WebSocket identity guard, which reloads instead
+ * of adopting a different user's token.
+ */
+export function jwtSubject(token: string): string | null {
+  const payload = token.split(".")[1];
+
+  if (payload === undefined || payload.length === 0) {
+    return null;
+  }
+
+  try {
+    const base64 = payload.replace(/-/g, "+").replace(/_/g, "/");
+    const padded = base64.padEnd(Math.ceil(base64.length / 4) * 4, "=");
+    const bytes = Uint8Array.from(atob(padded), (char) => char.charCodeAt(0));
+    const parsed: unknown = JSON.parse(new TextDecoder().decode(bytes));
+
+    if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+      return null;
+    }
+
+    const subject = (parsed as { sub?: unknown }).sub;
+
+    return typeof subject === "string" ? subject : null;
+  } catch {
+    return null;
+  }
+}
+
 interface ResponseParser<T> {
   parse: (input: unknown) => T;
 }
@@ -74,7 +112,7 @@ interface RequestJsonOptions {
   body?: unknown;
   /** Extra headers merged over the defaults; the auth header still wins. */
   headers?: Record<string, string>;
-  /** Attach the stored Bearer token and clear it if the API answers 401. */
+  /** Attach the stored Bearer token and recover it once via refresh on 401. */
   auth?: boolean;
 }
 
@@ -107,7 +145,12 @@ async function toApiError(response: Response): Promise<ApiClientError> {
   return new ApiClientError(response.status, code, message, body);
 }
 
-async function requestJson(path: string, options: RequestJsonOptions = {}): Promise<unknown> {
+async function requestJson(
+  path: string,
+  options: RequestJsonOptions = {},
+  /** Internal retry marker: the one transparent 401 recovery already ran. */
+  retried = false,
+): Promise<unknown> {
   const headers: Record<string, string> = {
     Accept: "application/json",
     ...options.headers,
@@ -133,11 +176,52 @@ async function requestJson(path: string, options: RequestJsonOptions = {}): Prom
   });
 
   if (!response.ok) {
+    const error = await toApiError(response);
+
     if (response.status === 401 && options.auth === true) {
-      clearAccessToken();
+      if (retried) {
+        // The retry with the freshly refreshed token was rejected too: the
+        // session is definitively over, so keep the old logout semantics.
+        clearAccessToken();
+        throw error;
+      }
+
+      // One transparent recovery: the access token lives 15 minutes while the
+      // refresh cookie lasts 14 days. Capture the identity before refreshing so
+      // a cookie that now belongs to another tab's user is never adopted.
+      const storedToken = getAccessToken();
+      const previousSub = storedToken === null ? null : jwtSubject(storedToken);
+      const fresh = await refreshAccessToken();
+
+      if (fresh === null) {
+        // 4xx from `/auth/refresh`: the cookie is missing, expired or revoked.
+        clearAccessToken();
+        throw error;
+      }
+
+      if (fresh === storedToken) {
+        // `refreshAccessToken` returns the stored token when the refresh could
+        // not be attempted (transport failure or 5xx). Nothing new to retry
+        // with, and a failed refresh is not proof of logout.
+        throw error;
+      }
+
+      const freshSub = jwtSubject(fresh);
+
+      if (previousSub !== null && freshSub !== null && previousSub !== freshSub) {
+        // The refresh cookie is shared by every tab and holds the LAST login's
+        // token. Never adopt that identity silently: leave the stored token
+        // untouched; the WebSocket guard's reload is the only identity switch.
+        throw error;
+      }
+
+      setAccessToken(fresh);
+
+      // Exactly one retry, with the token `setAccessToken` just stored.
+      return requestJson(path, options, true);
     }
 
-    throw await toApiError(response);
+    throw error;
   }
 
   if (response.status === 204) {

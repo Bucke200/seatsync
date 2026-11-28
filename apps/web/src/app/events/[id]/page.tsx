@@ -18,6 +18,7 @@ import {
   createHold,
   getAccessToken,
   getEvent,
+  jwtSubject,
   refreshAccessToken,
   releaseHold,
   setAccessToken,
@@ -233,40 +234,6 @@ function messageFor(error: unknown): string {
   return error instanceof Error ? error.message : "Something went wrong.";
 }
 
-/**
- * Read the `sub` claim out of an access token's payload. This is NOT signature
- * verification — the API already owns that — it only compares the identity the
- * page was rendered with against the identity a refresh handed back. Tokens are
- * base64url-encoded JWT segments, so `atob` needs the URL alphabet mapped back
- * and the padding restored. `atob` yields latin1 bytes, so the payload goes
- * through `TextDecoder` before `JSON.parse`; a non-ASCII `sub` must not decode
- * to mojibake and misfire the identity guard. Any malformed input yields `null`
- * (unknown identity), which the caller treats as "different" and never adopts
- * silently.
- */
-function accessTokenSubject(token: string): string | null {
-  const payload = token.split(".")[1];
-
-  if (payload === undefined || payload.length === 0) {
-    return null;
-  }
-
-  try {
-    const base64 = payload.replace(/-/g, "+").replace(/_/g, "/");
-    const padded = base64.padEnd(Math.ceil(base64.length / 4) * 4, "=");
-    const bytes = Uint8Array.from(atob(padded), (char) => char.charCodeAt(0));
-    const parsed: unknown = JSON.parse(new TextDecoder().decode(bytes));
-
-    if (!isRecord(parsed)) {
-      return null;
-    }
-
-    return typeof parsed.sub === "string" ? parsed.sub : null;
-  } catch {
-    return null;
-  }
-}
-
 export default function EventDetailPage() {
   const params = useParams<{ id: string }>();
   const eventId = params.id;
@@ -276,6 +243,11 @@ export default function EventDetailPage() {
   const [selectedSeatIds, setSelectedSeatIds] = useState<string[]>([]);
   const [activeHold, setActiveHold] = useState<ActiveHold | null>(null);
   const [holdError, setHoldError] = useState<string | null>(null);
+  /**
+   * The current `holdError` is the logged-out prompt, so the banner links to
+   * `/login` instead of looking like an API failure.
+   */
+  const [holdNeedsLogin, setHoldNeedsLogin] = useState(false);
   const [unavailableSeatIds, setUnavailableSeatIds] = useState<string[]>([]);
   const [submitting, setSubmitting] = useState(false);
   const [releasing, setReleasing] = useState(false);
@@ -350,6 +322,7 @@ export default function EventDetailPage() {
     setSelectedSeatIds([]);
     setActiveHold(null);
     setHoldError(null);
+    setHoldNeedsLogin(false);
     setUnavailableSeatIds([]);
 
     async function loadEvent(): Promise<void> {
@@ -424,7 +397,7 @@ export default function EventDetailPage() {
     }
 
     /** The identity this page was rendered with; a refresh must match it. */
-    const initialSub = accessTokenSubject(initialToken);
+    const initialSub = jwtSubject(initialToken);
     /**
      * Non-null alias: TypeScript does not keep the guard's narrowing inside the
      * nested reconnect functions, and the reload-failure path restores this
@@ -750,7 +723,7 @@ export default function EventDetailPage() {
         return;
       }
 
-      const refreshedSub = accessTokenSubject(token);
+      const refreshedSub = jwtSubject(token);
 
       if (refreshedSub !== initialSub) {
         // The shared cookie now belongs to another user. Never adopt that
@@ -891,6 +864,19 @@ export default function EventDetailPage() {
       return;
     }
 
+    if (getAccessToken() === null) {
+      // Anonymous visitors may browse and select, but a hold belongs to an
+      // account. Keep the selection so the user only has to press Hold again
+      // after logging in (the selection itself does not survive the navigation).
+      setHoldNeedsLogin(true);
+      setHoldError(
+        "Log in to hold seats — holding locks a seat for 10 minutes under your account.",
+      );
+      setUnavailableSeatIds([]);
+      return;
+    }
+
+    setHoldNeedsLogin(false);
     setSubmitting(true);
     setHoldError(null);
     setUnavailableSeatIds([]);
@@ -933,6 +919,7 @@ export default function EventDetailPage() {
 
     setReleasing(true);
     setHoldError(null);
+    setHoldNeedsLogin(false);
     setUnavailableSeatIds([]);
 
     try {
@@ -954,6 +941,7 @@ export default function EventDetailPage() {
 
     setPaying(true);
     setHoldError(null);
+    setHoldNeedsLogin(false);
     setUnavailableSeatIds([]);
 
     try {
@@ -1013,7 +1001,15 @@ export default function EventDetailPage() {
                   : "bg-red-50 text-red-700"
               }`}
             >
-              <p>{holdError}</p>
+              <p>
+                {holdNeedsLogin ? (
+                  <Link href="/login" className="font-medium underline">
+                    {holdError}
+                  </Link>
+                ) : (
+                  holdError
+                )}
+              </p>
               {unavailableLabels.length > 0 ? (
                 <p className="mt-1 font-medium">
                   No longer available: {unavailableLabels.join(", ")}
