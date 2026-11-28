@@ -37,4 +37,3 @@ Thumbs.db
 
 # Agent tooling context (kept local, not shared)
 .opencode/
-.neon

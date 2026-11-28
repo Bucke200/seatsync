@@ -265,12 +265,18 @@ Runtime environment variables:
   GitHub secret. Migrations use the direct URL.
 - **Upstash:** create a Redis database and copy its TLS `rediss://` URL. Put it
   on Render as `REDIS_URL` and in GitHub as `PROD_REDIS_URL`.
-- **Vercel:** create an account token and add it as `VERCEL_TOKEN`. The workflow
-  runs `vercel deploy --prod --yes` from `apps/web` and supplies
-  `API_PROXY_TARGET` and `NEXT_PUBLIC_WS_URL` as build environment values, so
-  they do not need to be configured in the dashboard. Both are derived from the
-  single `RENDER_API_URL` secret. The first successful run creates (or reuses)
-  the Vercel project and prints its production URL.
+- **Vercel:** create the project **once** in the dashboard — **Add New →
+  Project**, import the `seatsync` repository, set **Root Directory** to
+  `apps/web` (the framework is auto-detected as Next.js; the default build
+  settings work with the pnpm workspace). Then add an account token as
+  `VERCEL_TOKEN` and copy **Org ID** and **Project ID** from **Settings →
+  General** into the GitHub secrets `VERCEL_ORG_ID` and `VERCEL_PROJECT_ID`.
+  The workflow runs `vercel deploy --prod --yes` from `apps/web`; the CLI links
+  the fresh checkout to the existing project from those env values (no
+  `.vercel/project.json` is committed) and supplies `API_PROXY_TARGET` and
+  `NEXT_PUBLIC_WS_URL` as build environment values, so they do not need to be
+  configured in the dashboard. Both are derived from the single
+  `RENDER_API_URL` secret.
 - **Razorpay:** in test mode, add the webhook
   `https://<render-api>/webhooks/razorpay` with the events
   `payment_link.paid`, `payment_link.expired` and `payment_link.cancelled`.
@@ -289,6 +295,8 @@ Settings → Secrets and variables → Actions:
 | `PROD_JWT_SECRET` | `seed:demo` config validation | Same value as Render's `JWT_SECRET` |
 | `PAYMENT_WEBHOOK_SECRET` | `seed:demo` config validation | Same value as Render's `PAYMENT_WEBHOOK_SECRET` |
 | `VERCEL_TOKEN` | Vercel CLI deploy | Vercel account token |
+| `VERCEL_ORG_ID` | Vercel CLI deploy (project linking) | **Settings → General → Org ID** of the Vercel team/account |
+| `VERCEL_PROJECT_ID` | Vercel CLI deploy (project linking) | **Settings → General → Project ID** of the `seatsync` Vercel project |
 | `RAZORPAY_KEY_ID` | Not read by `deploy.yml` | Keep a copy with the other production secrets; set the same value on Render |
 | `RAZORPAY_KEY_SECRET` | Not read by `deploy.yml` | Keep a copy with the other production secrets; set the same value on Render |
 
@@ -302,8 +310,10 @@ it writes accounts, an event and seats, never payments.
    direct Neon URLs and the Upstash `rediss://` URL.
 2. Create the Render web service with the settings and environment variables
    above. Copy its public URL and create a deploy hook.
-3. Add all nine GitHub secrets. `RENDER_API_URL` is the URL from step 2.
-4. Add the Vercel token (`VERCEL_TOKEN`).
+3. Create the Vercel project once via the dashboard (**Add New → Project**,
+   import the `seatsync` repository, Root Directory `apps/web`) and copy its
+   **Org ID** and **Project ID** from **Settings → General**.
+4. Add all eleven GitHub secrets from the table above.
 5. Push or merge to `main`. `deploy.yml` runs its `ci` job, applies release
    migrations with `PROD_DATABASE_URL`, POSTs the Render deploy hook, deploys
    `apps/web` to Vercel production, waits for `/health`, runs `seed:demo`, and

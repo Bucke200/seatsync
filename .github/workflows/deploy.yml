@@ -6,10 +6,6 @@ on:
   push:
     branches: [main]
 
-# Least privilege: the release reads the repository and deploys outwards.
-permissions:
-  contents: read
-
 jobs:
   # D39: GitHub Actions `needs:` is intra-workflow only, so a separate
   # deploy.yml cannot literally depend on the `ci` job in ci.yml. This job is
@@ -20,6 +16,12 @@ jobs:
   ci:
     name: Lint, typecheck, migrate and test
     runs-on: ubuntu-latest
+
+    # upload-artifact@v4 needs actions: write to create the coverage artifact;
+    # everything else here only reads the repository.
+    permissions:
+      contents: read
+      actions: write
 
     # The workflow's own env vars win over the (absent in CI) repo-root .env
     # because every api script loads it with --env-file-if-exists.
@@ -110,6 +112,10 @@ jobs:
     needs: ci
     runs-on: ubuntu-latest
 
+    # Least privilege: the release reads the repository and deploys outwards.
+    permissions:
+      contents: read
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -126,10 +132,12 @@ jobs:
           PAYMENT_WEBHOOK_SECRET: ${{ secrets.PAYMENT_WEBHOOK_SECRET }}
           RENDER_DEPLOY_HOOK_URL: ${{ secrets.RENDER_DEPLOY_HOOK_URL }}
           VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+          VERCEL_ORG_ID: ${{ secrets.VERCEL_ORG_ID }}
+          VERCEL_PROJECT_ID: ${{ secrets.VERCEL_PROJECT_ID }}
         run: |
           set -euo pipefail
           missing=0
-          for name in RENDER_API_URL PROD_DATABASE_URL PROD_REDIS_URL PROD_JWT_SECRET PAYMENT_WEBHOOK_SECRET RENDER_DEPLOY_HOOK_URL VERCEL_TOKEN; do
+          for name in RENDER_API_URL PROD_DATABASE_URL PROD_REDIS_URL PROD_JWT_SECRET PAYMENT_WEBHOOK_SECRET RENDER_DEPLOY_HOOK_URL VERCEL_TOKEN VERCEL_ORG_ID VERCEL_PROJECT_ID; do
             if [ -z "${!name}" ]; then
               echo "::error::$name is empty. Set it in Settings > Secrets and variables > Actions (see README Deploy section)."
               missing=1
@@ -190,7 +198,11 @@ jobs:
       - name: Deploy web to Vercel (production)
         working-directory: apps/web
         env:
+          # The CLI links the checkout to an existing project from these env
+          # values alone; no .vercel/project.json is needed on a fresh runner.
           VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+          VERCEL_ORG_ID: ${{ secrets.VERCEL_ORG_ID }}
+          VERCEL_PROJECT_ID: ${{ secrets.VERCEL_PROJECT_ID }}
           RENDER_API_URL: ${{ secrets.RENDER_API_URL }}
         run: |
           set -euo pipefail
