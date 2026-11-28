@@ -22,6 +22,8 @@ export interface SeatRecord {
   number: number;
   pricePaise: number;
   status: SeatStatus;
+  /** D29: per-seat version; the client stale filter uses it (Rule 7). */
+  version: number;
   /** Present only on the viewer's own active hold (D15). */
   holdId?: string;
   /** ISO timestamp of the viewer's own active hold (D15). */
@@ -83,6 +85,7 @@ interface SeatRow extends QueryResultRow {
   number: number;
   price_paise: number;
   status: SeatStatus;
+  version: number;
   hold_id: string | null;
   held_until: Date | null;
 }
@@ -179,6 +182,7 @@ export async function listSeatsByEventId(
               WHEN status = 'HELD' AND held_until < now() THEN 'AVAILABLE'
               ELSE status
             END AS status,
+            version,
             CASE
               WHEN $2::uuid IS NOT NULL
                AND held_by = $2::uuid
@@ -207,6 +211,7 @@ export async function listSeatsByEventId(
       number: row.number,
       pricePaise: row.price_paise,
       status: row.status,
+      version: row.version,
     };
 
     if (row.hold_id !== null && row.held_until !== null) {

@@ -1,10 +1,27 @@
 "use client";
 
-import type { ErrorResponse, EventDetail, EventStatus, Seat, SeatStatus } from "@seatsync/shared";
+import {
+  applySeatVersionFilter,
+  mergeSeatSnapshot,
+  type ErrorResponse,
+  type EventDetail,
+  type EventStatus,
+  type Seat,
+  type SeatStatus,
+} from "@seatsync/shared";
 import Link from "next/link";
 import { useParams } from "next/navigation";
-import { useCallback, useEffect, useState } from "react";
-import { createCheckout, createHold, getEvent, releaseHold } from "@/lib/api";
+import { useCallback, useEffect, useRef, useState } from "react";
+import {
+  clearAccessToken,
+  createCheckout,
+  createHold,
+  getAccessToken,
+  getEvent,
+  refreshAccessToken,
+  releaseHold,
+  setAccessToken,
+} from "@/lib/api";
 import { formatDateTime, formatPaise } from "@/lib/format";
 
 /**
@@ -14,6 +31,25 @@ import { formatDateTime, formatPaise } from "@/lib/format";
  * sending a request the web already knows will fail.
  */
 const MAX_SEATS_PER_HOLD = 6;
+
+/**
+ * D30: Next.js rewrites proxy HTTP only, so the browser opens the API's `/ws`
+ * directly. `NEXT_PUBLIC_WS_URL` is inlined by Next at build time; the fallback
+ * is the local API port.
+ */
+const WS_URL = process.env.NEXT_PUBLIC_WS_URL ?? "ws://localhost:4000/ws";
+
+/**
+ * Reconnect policy (spec §331): start at 1 s and double up to a 15 s ceiling,
+ * then keep retrying at the ceiling. The attempt counter is reset only after a
+ * successful `subscribed` ack, so a flapping server cannot hammer `/ws`.
+ */
+const WS_RECONNECT_BASE_DELAY_MS = 1_000;
+const WS_RECONNECT_MAX_DELAY_MS = 15_000;
+
+/** The exact spec wording for the "your seat was taken" notice. */
+const SEAT_TAKEN_MESSAGE = "Seat just taken";
+const SEAT_TAKEN_TOAST_MS = 4_000;
 
 const SEAT_STATUS_STYLES: Record<SeatStatus, string> = {
   AVAILABLE:
@@ -50,6 +86,52 @@ interface ActiveHold {
 interface OwnHeldSeat extends Seat {
   holdId: string;
   heldUntil: string;
+}
+
+/**
+ * One seat inside a live update. This is the publisher's wire shape
+ * (`apps/api/src/realtime/publisher.ts`), forwarded verbatim by the subscriber:
+ * `{ eventId, seats: [{ id, status, version }] }`. It deliberately has no
+ * `type` discriminator — only `auth_ok`, `subscribed` and `error` do — so seat
+ * frames are recognised by shape.
+ */
+interface LiveSeatUpdate {
+  id: string;
+  status: SeatStatus;
+  version: number;
+}
+
+interface LiveSeatFrame {
+  eventId: string;
+  seats: LiveSeatUpdate[];
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function isSeatStatus(value: unknown): value is SeatStatus {
+  return value === "AVAILABLE" || value === "HELD" || value === "BOOKED";
+}
+
+function isLiveSeatUpdate(value: unknown): value is LiveSeatUpdate {
+  return (
+    isRecord(value) &&
+    typeof value.id === "string" &&
+    isSeatStatus(value.status) &&
+    typeof value.version === "number" &&
+    Number.isInteger(value.version) &&
+    value.version >= 0
+  );
+}
+
+function isLiveSeatFrame(value: unknown): value is LiveSeatFrame {
+  return (
+    isRecord(value) &&
+    typeof value.eventId === "string" &&
+    Array.isArray(value.seats) &&
+    value.seats.every(isLiveSeatUpdate)
+  );
 }
 
 function groupSeatsBySection(seats: Seat[]): SectionGroup[] {
@@ -156,24 +238,68 @@ export default function EventDetailPage() {
   const [releasing, setReleasing] = useState(false);
   const [paying, setPaying] = useState(false);
   const [now, setNow] = useState(() => Date.now());
+  /**
+   * A monotonically increasing counter, not the message text: two taken seats
+   * within one toast window must restart the 4 s dismiss timer even though the
+   * visible wording is identical.
+   */
+  const [seatTakenToast, setSeatTakenToast] = useState(0);
+
+  /**
+   * D29: `seatId -> last applied version`. A lookup table for the stale filter,
+   * never rendered, hence a ref and not state. It survives reconnects so an
+   * in-flight retry cannot apply an older frame; a snapshot resets it.
+   */
+  const seatVersionsRef = useRef<Map<string, number>>(new Map());
+  /** Latest selection for the socket handler without re-opening the socket. */
+  const selectedSeatIdsRef = useRef<string[]>([]);
+  /**
+   * Seats in a hold request currently on the wire. A HELD frame for one of
+   * these is our own hold, not "someone else took it", so it must not toast.
+   */
+  const holdInFlightSeatIdsRef = useRef<string[]>([]);
+
+  useEffect(() => {
+    selectedSeatIdsRef.current = selectedSeatIds;
+  }, [selectedSeatIds]);
+
+  // Minimal inline toast: auto-dismiss, no portal and no new dependency.
+  useEffect(() => {
+    if (seatTakenToast === 0) {
+      return;
+    }
+
+    const timer = window.setTimeout(() => setSeatTakenToast(0), SEAT_TAKEN_TOAST_MS);
+
+    return () => window.clearTimeout(timer);
+  }, [seatTakenToast]);
+
+  /**
+   * Apply an authoritative `GET /events/:id` result to every piece of state
+   * that derives from it. Both the REST refresh and the socket resync use this,
+   * so a snapshot cannot diverge from a manual refresh.
+   */
+  const applyEventDetail = useCallback((detail: EventDetail): void => {
+    setEvent(detail);
+    setActiveHold(activeHoldFromEvent(detail));
+    // A refresh can turn a selected seat into HELD/BOOKED; drop those ids so
+    // the next request never includes a seat that is no longer selectable.
+    setSelectedSeatIds((current) =>
+      current.filter((id) =>
+        detail.seats.some((seat) => seat.id === id && seat.status === "AVAILABLE"),
+      ),
+    );
+  }, []);
 
   const refreshEvent = useCallback(async (): Promise<void> => {
     try {
       const detail = await getEvent(eventId);
 
-      setEvent(detail);
-      setActiveHold(activeHoldFromEvent(detail));
-      // A refresh can turn a selected seat into HELD/BOOKED; drop those ids so
-      // the next request never includes a seat that is no longer selectable.
-      setSelectedSeatIds((current) =>
-        current.filter((id) =>
-          detail.seats.some((seat) => seat.id === id && seat.status === "AVAILABLE"),
-        ),
-      );
+      applyEventDetail(detail);
     } catch (err) {
       setError(messageFor(err));
     }
-  }, [eventId]);
+  }, [eventId, applyEventDetail]);
 
   useEffect(() => {
     let cancelled = false;
@@ -211,6 +337,297 @@ export default function EventDetailPage() {
       cancelled = true;
     };
   }, [eventId]);
+
+  /**
+   * Sprint 4 live seat map (D29/D30).
+   *
+   * Only authenticated viewers connect: `/ws` has no anonymous mode, so a
+   * public viewer would only earn an UNAUTHORIZED close. This runs inside an
+   * effect, so server rendering never opens a socket.
+   *
+   * Reconnect: on close, wait 1 s → 2 s → 4 s → 8 s → 15 s, then keep retrying
+   * at 15 s. Each attempt refreshes the access token from the httpOnly cookie,
+   * then re-auths, re-subscribes and refetches the snapshot. A failed refresh
+   * means the session is gone: stop the loop and clear the stored token exactly
+   * like `requestJson`'s 401 path, so no dead token keeps going to REST.
+   */
+  useEffect(() => {
+    const initialToken = getAccessToken();
+
+    if (initialToken === null) {
+      return;
+    }
+
+    let stopped = false;
+    let socket: WebSocket | null = null;
+    let reconnectTimer: number | null = null;
+    let attempt = 0;
+    let connectionGeneration = 0;
+
+    // A different event (effect re-run) must never inherit another map.
+    seatVersionsRef.current.clear();
+
+    function send(payload: unknown): void {
+      if (socket?.readyState === WebSocket.OPEN) {
+        socket.send(JSON.stringify(payload));
+      }
+    }
+
+    function applyLiveSeats(updates: LiveSeatUpdate[]): void {
+      const filter = applySeatVersionFilter(seatVersionsRef.current, updates);
+
+      if (filter.accepted.length === 0) {
+        return;
+      }
+
+      const acceptedIds = new Set(filter.accepted);
+      const accepted = updates.filter((update) => acceptedIds.has(update.id));
+
+      // The filter has already advanced the map for accepted ids; the snapshot
+      // merge is the shared, documented way to fold versions into it.
+      mergeSeatSnapshot(seatVersionsRef.current, accepted);
+
+      const acceptedById = new Map(accepted.map((update) => [update.id, update]));
+
+      setEvent((current) => {
+        if (current === null) {
+          return current;
+        }
+
+        // Updating the seat status is enough: the grid's existing render
+        // branches (AVAILABLE clickable, HELD/BOOKED disabled, heldByMe blue)
+        // re-colour from this state, so live and initial renders cannot diverge.
+        return {
+          ...current,
+          seats: current.seats.map((seat) => {
+            const update = acceptedById.get(seat.id);
+
+            return update === undefined
+              ? seat
+              : { ...seat, status: update.status, version: update.version };
+          }),
+        };
+      });
+
+      const takenFromSelection = new Set(
+        accepted
+          .filter((update) => update.status !== "AVAILABLE")
+          .map((update) => update.id)
+          .filter(
+            (id) =>
+              selectedSeatIdsRef.current.includes(id) &&
+              !holdInFlightSeatIdsRef.current.includes(id),
+          ),
+      );
+
+      if (takenFromSelection.size === 0) {
+        return;
+      }
+
+      // D30: a selected seat that someone else just held/booked is dropped. The
+      // update only removes ids, so the local MAX_SEATS_PER_HOLD=6 cap stays
+      // satisfied; the toast tells the viewer why their selection shrank.
+      setSelectedSeatIds((current) =>
+        current.filter((id) => !takenFromSelection.has(id)),
+      );
+      setSeatTakenToast((count) => count + 1);
+    }
+
+    async function resyncSnapshot(): Promise<void> {
+      try {
+        const detail = await getEvent(eventId);
+
+        if (stopped) {
+          return;
+        }
+
+        // D29: the snapshot is truth after every (re)connect. Clear the map so
+        // a change missed while disconnected cannot survive as a higher version.
+        seatVersionsRef.current.clear();
+        mergeSeatSnapshot(seatVersionsRef.current, detail.seats);
+        applyEventDetail(detail);
+      } catch (err) {
+        // Keep the socket alive: the page-level load/refresh already reports
+        // REST failures, and a later reconnect snapshots again.
+        console.warn("SeatSync live updates: snapshot refetch failed", err);
+      }
+    }
+
+    function handleFrame(raw: string): void {
+      let parsed: unknown;
+
+      try {
+        parsed = JSON.parse(raw) as unknown;
+      } catch {
+        return;
+      }
+
+      if (!isRecord(parsed)) {
+        return;
+      }
+
+      if (typeof parsed.type === "string") {
+        if (parsed.type === "auth_ok") {
+          send({ type: "subscribe", eventId });
+          return;
+        }
+
+        if (parsed.type === "subscribed") {
+          if (parsed.eventId === eventId) {
+            // Only a completed subscribe proves the whole chain works, so the
+            // backoff resets here rather than on TCP/WS open.
+            attempt = 0;
+            void resyncSnapshot();
+          }
+          return;
+        }
+
+        if (parsed.type === "error") {
+          const code = typeof parsed.code === "string" ? parsed.code : "UNKNOWN";
+          const message =
+            typeof parsed.message === "string" ? parsed.message : "unknown error";
+
+          console.warn(`SeatSync live updates: server error ${code}: ${message}`);
+          return;
+        }
+
+        return;
+      }
+
+      // Seat frames are broadcast verbatim by the Redis subscriber and therefore
+      // carry no `type`: `{ eventId, seats: [{ id, status, version }] }`.
+      if (isLiveSeatFrame(parsed) && parsed.eventId === eventId) {
+        applyLiveSeats(parsed.seats);
+      }
+    }
+
+    function connect(token: string): void {
+      if (stopped) {
+        return;
+      }
+
+      let ws: WebSocket;
+
+      try {
+        ws = new WebSocket(WS_URL);
+      } catch (err) {
+        // A malformed NEXT_PUBLIC_WS_URL must not break the page; live updates
+        // stay off until the configuration is fixed and the page reloads.
+        console.warn("SeatSync live updates: invalid WebSocket URL", err);
+        return;
+      }
+
+      socket = ws;
+      const generation = ++connectionGeneration;
+
+      ws.onopen = () => {
+        if (stopped || generation !== connectionGeneration) {
+          return;
+        }
+
+        ws.send(JSON.stringify({ type: "auth", token }));
+      };
+
+      ws.onmessage = (message) => {
+        if (stopped || generation !== connectionGeneration) {
+          return;
+        }
+
+        if (typeof message.data === "string") {
+          handleFrame(message.data);
+        }
+      };
+
+      ws.onerror = () => {
+        // Deliberately quiet: the browser's opaque error event is always
+        // followed by close, and `onclose` owns the single reconnect/log path so
+        // a dead server cannot flood the console.
+      };
+
+      ws.onclose = () => {
+        if (generation !== connectionGeneration) {
+          return;
+        }
+
+        socket = null;
+
+        if (!stopped) {
+          scheduleReconnect();
+        }
+      };
+    }
+
+    function scheduleReconnect(): void {
+      if (stopped || reconnectTimer !== null) {
+        return;
+      }
+
+      const delay = Math.min(
+        WS_RECONNECT_BASE_DELAY_MS * 2 ** Math.min(attempt, 4),
+        WS_RECONNECT_MAX_DELAY_MS,
+      );
+
+      attempt += 1;
+      reconnectTimer = window.setTimeout(() => {
+        reconnectTimer = null;
+        void reconnect();
+      }, delay);
+    }
+
+    async function reconnect(): Promise<void> {
+      if (stopped) {
+        return;
+      }
+
+      const token = await refreshAccessToken();
+
+      if (stopped) {
+        return;
+      }
+
+      if (token === null) {
+        // Logged out or the refresh cookie expired: no later attempt can
+        // authenticate. Mirror `requestJson`'s 401 path and stop.
+        clearAccessToken();
+        console.warn("SeatSync live updates: session expired; reconnect stopped");
+        return;
+      }
+
+      // Persist before connecting: the subscribe snapshot's REST call reads it.
+      setAccessToken(token);
+      connect(token);
+    }
+
+    connect(initialToken);
+
+    return () => {
+      stopped = true;
+      connectionGeneration += 1;
+
+      if (reconnectTimer !== null) {
+        window.clearTimeout(reconnectTimer);
+        reconnectTimer = null;
+      }
+
+      const dying = socket;
+      socket = null;
+
+      if (dying !== null) {
+        // Detach first so a deliberate close cannot schedule a reconnect.
+        dying.onopen = null;
+        dying.onmessage = null;
+        dying.onerror = null;
+        dying.onclose = null;
+
+        try {
+          dying.close();
+        } catch {
+          // Closing a still-connecting socket can throw in some browsers; the
+          // handlers are already detached, so there is nothing left to clean.
+        }
+      }
+    };
+  }, [eventId, applyEventDetail]);
 
   // One shared ticker keeps the countdown and the per-seat tooltips live.
   useEffect(() => {
@@ -269,6 +686,11 @@ export default function EventDetailPage() {
     setHoldError(null);
     setUnavailableSeatIds([]);
 
+    // The API emits HELD frames for this request's own seats after COMMIT. Guard
+    // them so the live handler cannot mistake our successful hold for someone
+    // else taking the seats (the 201 path clears the selection itself).
+    holdInFlightSeatIdsRef.current = selectedSeatIds;
+
     try {
       // D2: a fresh key per click; never reuse a key for a different attempt.
       const result = await createHold(eventId, selectedSeatIds, crypto.randomUUID());
@@ -290,6 +712,7 @@ export default function EventDetailPage() {
       // 422/400/404 and other errors carry the API envelope message.
       setHoldError(messageFor(err));
     } finally {
+      holdInFlightSeatIdsRef.current = [];
       setSubmitting(false);
     }
   }
@@ -564,6 +987,17 @@ export default function EventDetailPage() {
             </div>
           )}
         </>
+      ) : null}
+
+      {/* D30: fixed, self-dismissing notice; no dependency and no portal. */}
+      {seatTakenToast > 0 ? (
+        <div
+          role="status"
+          aria-live="polite"
+          className="fixed bottom-6 right-6 z-50 rounded-lg bg-slate-900 px-4 py-3 text-sm font-medium text-white shadow-lg"
+        >
+          {SEAT_TAKEN_MESSAGE}
+        </div>
       ) : null}
     </main>
   );

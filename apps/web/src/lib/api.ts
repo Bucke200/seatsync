@@ -8,6 +8,7 @@ import {
   HoldResponseSchema,
   MeBookingsResponseSchema,
   PaginatedEventsResponseSchema,
+  RefreshResponseSchema,
 } from "@seatsync/shared";
 import type {
   AuthResponse,
@@ -144,6 +145,46 @@ async function requestJson(path: string, options: RequestJsonOptions = {}): Prom
   }
 
   return response.json();
+}
+
+/**
+ * D29 reconnect flow: trade the httpOnly refresh cookie for a fresh access
+ * token. `credentials: "include"` is explicit because the cookie, not a
+ * request body, is the credential; the endpoint needs no body.
+ *
+ * Returns `null` instead of throwing. This runs inside the live-update socket
+ * reconnect loop, where "no valid session" (a 4xx after the cookie expired or
+ * the user logged out) is a normal stop condition rather than an error to
+ * surface. A transport failure is *not* proof of logout, so it falls back to
+ * the token already in memory: the caller's capped backoff then keeps retrying
+ * instead of killing live updates because the API was briefly unreachable.
+ */
+export async function refreshAccessToken(): Promise<string | null> {
+  try {
+    const response = await fetch("/api/auth/refresh", {
+      method: "POST",
+      headers: { Accept: "application/json" },
+      credentials: "include",
+      cache: "no-store",
+    });
+
+    if (!response.ok) {
+      // 4xx = the refresh cookie is missing, expired or revoked. Anything else
+      // (5xx, proxy error) is transient and cannot distinguish a live session.
+      if (response.status >= 400 && response.status < 500) {
+        return null;
+      }
+
+      return getAccessToken();
+    }
+
+    const payload: unknown = await response.json();
+    const parsed = RefreshResponseSchema.safeParse(payload);
+
+    return parsed.success ? parsed.data.accessToken : null;
+  } catch {
+    return getAccessToken();
+  }
 }
 
 export async function signup(input: SignupRequest): Promise<AuthResponse> {

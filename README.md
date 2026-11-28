@@ -127,6 +127,66 @@ To use Razorpay, set `PAYMENT_PROVIDER=razorpay` together with `RAZORPAY_KEY_ID`
 
 **Blocked — Human:** in the Razorpay sandbox, pay with a test card and then resend the same webhook event from the Razorpay CLI or dashboard; the booking must not change. This live card + resend check is still pending real sandbox keys.
 
+## Sprint 4 — Real-time seat map
+
+Sprint 4 makes every open browser see seat changes within `LIVE_UPDATE_MAX_MS`, across multiple API instances:
+
+- **WebSocket server:** `WS /ws` shares the API's HTTP server. The client's first frame must be `{ "type": "auth", "token" }` (acknowledged with `{ "type": "auth_ok" }`); `{ "type": "subscribe", "eventId" }` then joins that event's room (acknowledged with `{ "type": "subscribed", "eventId" }`). A bad or expired token, a non-auth first frame or a pre-auth subscribe gets `{ "type": "error", "code": "UNAUTHORIZED" }` and close code `1008` — there is no anonymous mode. After authentication, unknown frames and duplicate auth get `BAD_MESSAGE` without closing, while a non-UUID subscribe is fatal; a 30-second ping/pong heartbeat terminates any socket that misses one pong.
+- **Fan-out:** `realtime/publisher.ts` listens to the post-commit `seatEvents` emitter, groups same-tick per-seat changes per event and publishes `{ eventId, seats: [{ id, status, version }] }` to `seats:{eventId}`. Every instance's `realtime/subscriber.ts` `PSUBSCRIBE`s `seats:*` and forwards each message to the sockets in that room. Grouping is transport only: each seat keeps the exact version its own `UPDATE ... RETURNING` produced (Rule 7).
+- **Redis stays optional:** publisher and subscriber use dedicated connections (never the shared `/health` client) with no offline command queue and a 250 ms → 5 s capped reconnect backoff. Publish/subscribe failures are logged and dropped, so a Redis outage can never block or fail a hold, booking or webhook; when Redis returns, the subscription resumes and live updates continue. `redis-down.test.ts` proves holds still return `201` and the Sprint 2 race suite still passes while the realtime pub/sub connections cannot reach Redis.
+- **Client stale filter:** `GET /events/:id` now returns each seat's `version`; the web app keeps a `Map<seatId, version>` and applies a WebSocket update only when its version is strictly greater (shared `applySeatVersionFilter` / `mergeSeatSnapshot` helpers in `packages/shared`). Duplicate or out-of-order frames are ignored.
+- **Live UX:** seat colours change immediately. If another user takes a seat in the current selection, it is deselected and a "Seat just taken" toast appears; a seat whose hold request is already in flight is exempt because that frame is the viewer's own hold.
+- **Reconnect:** a closed socket retries after 1 s, 2 s, 4 s, 8 s and then every 15 s. Each attempt refreshes the access token through the httpOnly cookie, re-authenticates and re-subscribes, then refetches `GET /events/:id` and rebuilds the version map, so a change missed while disconnected cannot survive as a newer version. A 4xx refresh (the session is gone) stops the loop; a 5xx or transport blip keeps the stored token and retries.
+- **WS URL:** the browser connects directly to `NEXT_PUBLIC_WS_URL ?? "ws://localhost:4000/ws"`. The Next.js `/api/*` rewrite is HTTP-only and cannot proxy an `Upgrade`, so the socket must not go through it. `NEXT_PUBLIC_WS_URL` is inlined at build time; set it (for example `NEXT_PUBLIC_WS_URL=ws://localhost:4010/ws pnpm --filter web build`) when pointing the web app at another API host or at the scale stack.
+- **Tests:** seven suites under `apps/api/test/realtime/`: the five design.md acceptance checks (`live`, `multi-instance`, `redis-down`, `stale`, `reconnect`) plus `ws.protocol` (auth, `1008` and room rules) and `publisher` (same-tick grouping, later-write-wins, corrupt-message resilience).
+- **Scale:** `docker-compose.scale.yml` runs two `api` replicas behind nginx on `http://localhost:4010`, sharing one Postgres and Redis; a client on one replica receives a change committed through the other. Boot it with the command in the next section.
+
+Try it: open http://localhost:3000/events in two browser tabs as two attendees — a seat held in one tab turns HELD in the other within `LIVE_UPDATE_MAX_MS`.
+
+## Multi-instance scale stack (Sprint 4)
+
+`docker-compose.scale.yml` verifies that the realtime seat map works across more than one API process: two `api` replicas share one Postgres and one Redis, sit behind `nginx` (which round-robins Docker DNS A-records and forwards WebSocket `Upgrade` headers), and a client on one replica receives changes committed through another replica via Redis pub/sub. It is a **standalone** compose file, not an override: the `seatsync-scale` project has its own database, Redis and named volume, so it can run beside the normal development stack without touching it.
+
+Host ports are deliberately shifted so both stacks can run at once (`SCALE_DB_PORT`, `SCALE_REDIS_PORT`, `NGINX_PORT`, `WEB_PORT` override them):
+
+| Service | Scale stack | Normal stack |
+| --- | --- | --- |
+| API HTTP + WS | `http://localhost:4010` (nginx) | `http://localhost:4000` (api) |
+| Web | `http://localhost:3010` | `http://localhost:3000` |
+| Postgres | `localhost:5435` | `localhost:5434` |
+| Redis | `localhost:6380` | `localhost:6379` |
+
+Migrations run **once per stack start**: the one-shot `migrate` service applies them and exits, and both replicas wait for `service_completed_successfully`. The replica command is `node --import tsx src/server.ts`, deliberately skipping migrate-on-boot so two processes can never race `node-pg-migrate`. To apply migrations without starting the stack:
+
+```bash
+docker compose -f docker-compose.scale.yml -p seatsync-scale run --rm migrate
+```
+
+Boot it (the migrate step above runs automatically; `--scale api=2` starts the two replicas):
+
+```bash
+docker compose -f docker-compose.scale.yml -p seatsync-scale up -d --build --scale api=2
+```
+
+Verify it:
+
+```bash
+curl.exe -s -o NUL -w "%{http_code}" http://localhost:4010/health
+# 200 — the access log records upstream=<replica-ip>:4000; repeat the request
+# and the two upstream addresses prove nginx is balancing both replicas
+docker compose -f docker-compose.scale.yml -p seatsync-scale ps
+docker compose -f docker-compose.scale.yml -p seatsync-scale logs nginx
+```
+
+A WebSocket client connects directly to `ws://localhost:4010/ws` (nginx proxies `Upgrade`/`Connection` with a one-hour idle read timeout); REST goes through the web app's `/api/*` proxy or straight to `http://localhost:4010`. Because the browser cannot use a compose hostname, the WS URL names the host-visible nginx port, not `api:4000`. The scale stack's web image is built with the default `ws://localhost:4000/ws`; to drive the seat map through nginx from a browser, run the web app with `NEXT_PUBLIC_WS_URL=ws://localhost:4010/ws` (inlined at build time).
+
+Tear it down completely, including only the scale project's own volume:
+
+```bash
+docker compose -f docker-compose.scale.yml -p seatsync-scale down -v
+docker volume ls   # seatsync_pgdata (the normal stack's volume) is still there
+```
+
 ## CI
 
 `.github/workflows/ci.yml` runs on every push (all branches) and on pull requests. A single Ubuntu job uses Node.js 22 and pnpm 10.8.1, with `postgres:16` and `redis:7` service containers, then runs `pnpm install --frozen-lockfile`, `pnpm lint`, `pnpm typecheck`, `pnpm --filter api migrate up`, `pnpm --filter api migrate down`, `pnpm --filter api migrate up` and `pnpm test`. CI uses the standard Postgres port 5432 because the hosted runner is clean; local development uses 5434 (see below).

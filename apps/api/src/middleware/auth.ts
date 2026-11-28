@@ -22,7 +22,18 @@ function readBearerToken(req: Request): string | null {
   return match?.[1] ?? null;
 }
 
-function verifyAccessToken(token: string, config: Config): { id: string; role: UserRole } {
+/**
+ * Verify a JWT access token and return the principal it names.
+ *
+ * Shared by the HTTP middleware and the `/ws` handshake (D28): the validation
+ * semantics are deliberately identical — a string `sub` and an
+ * `ORGANIZER`/`ATTENDEE` `role` are required, and anything else throws an
+ * `ApiError(401, "UNAUTHORIZED")`.
+ */
+export function verifyAccessToken(
+  token: string,
+  config: Config,
+): { id: string; role: UserRole } {
   let payload: string | jwt.JwtPayload;
 
   try {
