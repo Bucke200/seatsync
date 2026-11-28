@@ -149,12 +149,17 @@ function readStringField(value: unknown, field: string): string | undefined {
  * HTTP 400 with `error.description` =
  * "The payment has been fully refunded already" (observed live 2026-11-28).
  * The match is a tolerant case-insensitive substring that accepts either word
- * order (`already refunded` / `refunded already`, with optional `fully`), so
- * wording tweaks still converge (D38). A literal `/already\s+refunded/` would
- * miss the observed phrase, whose trailing order is "refunded already".
+ * order with optional `fully`, so wording tweaks still converge (D38):
+ * - trailing order requires the affirmative auxiliary directly before
+ *   "refunded" (`has been refunded already`);
+ * - canonical order requires "already" directly before "refunded"
+ *   (`already refunded`).
+ * A bare `/refunded\s+already/` would also match the negation "has not been
+ * refunded already", which is a different error; the auxiliary guard above
+ * keeps negated phrasings from resolving the refund.
  */
 const ALREADY_REFUNDED_DESCRIPTION =
-  /already\s+(?:fully\s+)?refunded|refunded\s+already/i;
+  /(?:has been|was|is)\s+(?:fully\s+)?refunded\s+already|already\s+(?:fully\s+)?refunded/i;
 
 function isAlreadyRefundedError(body: unknown): boolean {
   if (typeof body !== "object" || body === null) {

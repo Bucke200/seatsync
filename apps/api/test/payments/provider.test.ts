@@ -88,11 +88,18 @@ function signRazorpay(rawBody: Buffer): string {
   return createHmac("sha256", SECRET).update(rawBody).digest("hex");
 }
 
+/**
+ * Per-test snapshot of the real fetch. Taking it inside `beforeEach` instead
+ * of at module load means every test restores the fetch that was actually in
+ * place when it started, even if an earlier test (or suite) swapped
+ * `global.fetch` before this file's tests ran.
+ */
+let originalFetch: typeof fetch;
+
 beforeEach(() => {
   fakePaymentControls.reset();
+  originalFetch = global.fetch;
 });
-
-const originalFetch = global.fetch;
 
 /**
  * Stub `global.fetch` with one refund response. `refund()` reads only `ok`,
@@ -314,6 +321,37 @@ describe("razorpay refund", () => {
     await expect(
       razorpayProvider().refund("pay_TEST123", 12_500),
     ).resolves.toBeUndefined();
+
+    // The canonical "already refunded" word order must converge too.
+    stubRefundResponse(400, {
+      error: {
+        code: "BAD_REQUEST_ERROR",
+        description: "The payment is already fully refunded",
+        source: "business",
+        step: "refund",
+        reason: "payment_refunded",
+      },
+    });
+
+    await expect(
+      razorpayProvider().refund("pay_TEST123", 12_500),
+    ).resolves.toBeUndefined();
+  });
+
+  it("still throws for a negated 'refunded already' description", async () => {
+    stubRefundResponse(400, {
+      error: {
+        code: "BAD_REQUEST_ERROR",
+        description: "The payment has not been refunded already",
+        source: "business",
+        step: "refund",
+        reason: "payment_not_refunded",
+      },
+    });
+
+    await expect(
+      razorpayProvider().refund("pay_TEST123", 12_500),
+    ).rejects.toThrow(PaymentProviderRequestError);
   });
 
   it("still throws PaymentProviderRequestError for a non-replay 400", async () => {
