@@ -29,7 +29,7 @@ export default function SignupPage() {
 
     try {
       const session = await signup(parsed.data);
-      setAccessToken(session.accessToken);
+      setAccessToken(session.accessToken, session.user);
       router.push(session.user.role === "ORGANIZER" ? "/organizer/events/new" : "/events");
     } catch (err) {
       setError(err instanceof ApiClientError ? err.message : "Signup failed. Please try again.");
@@ -39,7 +39,7 @@ export default function SignupPage() {
   }
 
   return (
-    <main className="flex min-h-screen items-center justify-center bg-slate-50 p-6">
+    <main className="flex min-h-[calc(100vh-4rem)] items-center justify-center bg-slate-50 p-6">
       <form
         onSubmit={(event) => void handleSubmit(event)}
         className="w-full max-w-md space-y-5 rounded-2xl border border-slate-200 bg-white p-8 shadow-sm"
@@ -72,7 +72,9 @@ export default function SignupPage() {
             onChange={(event) => setPassword(event.target.value)}
             className="mt-1 w-full rounded-lg border border-slate-300 px-3 py-2 font-normal outline-none focus:border-slate-500 focus:ring-2 focus:ring-slate-200"
           />
-          <span className="mt-1 block text-xs font-normal text-slate-500">At least 8 characters.</span>
+          <span className="mt-1 block text-xs font-normal text-slate-500">
+            At least 8 characters.
+          </span>
         </label>
 
         <label className="block text-sm font-medium text-slate-700">

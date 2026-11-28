@@ -17,6 +17,12 @@ export interface CreateCheckoutInput {
   holdId: string;
   /** Integer paise (Rule 6). */
   amountPaise: number;
+  /**
+   * Absolute URL the provider redirects the customer to after a successful
+   * payment. Optional: providers that support it (Razorpay Payment Links)
+   * include it in the checkout request; the fake provider ignores it.
+   */
+  callbackUrl?: string;
 }
 
 export interface CreateCheckoutResult {

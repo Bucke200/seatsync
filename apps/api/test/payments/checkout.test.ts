@@ -18,7 +18,10 @@ import { loadConfig, type Config } from "../../src/config";
 import { createCheckoutForHold } from "../../src/db/bookings";
 import { createPool } from "../../src/db/pool";
 import { createRedisClient } from "../../src/realtime/redis";
-import type { PaymentProvider } from "../../src/payments";
+import type {
+  CreateCheckoutInput,
+  PaymentProvider,
+} from "../../src/payments";
 import { truncateAll } from "../helpers/db";
 
 /**
@@ -174,6 +177,34 @@ describe("checkout", () => {
     return request(app)
       .post(`/holds/${holdId}/checkout`)
       .set("Authorization", `Bearer ${accessToken}`);
+  }
+
+  interface RecordingProvider {
+    calls: CreateCheckoutInput[];
+    provider: PaymentProvider;
+  }
+
+  /** Minimal offline provider that records every createCheckout input. */
+  function recordingProvider(): RecordingProvider {
+    const calls: CreateCheckoutInput[] = [];
+
+    return {
+      calls,
+      provider: {
+        async createCheckout(input) {
+          calls.push(input);
+          return {
+            checkoutUrl: `/bookings/${input.bookingId}?fakeCheckout=1`,
+          };
+        },
+        verifyWebhook: () => {
+          throw new Error("not used by checkout");
+        },
+        refund: async () => {
+          // not used by checkout
+        },
+      },
+    };
   }
 
   interface SetupOptions {
@@ -454,6 +485,61 @@ describe("checkout", () => {
       expect(response.status).toBe(400);
       expect(response.body.error.code).toBe("VALIDATION_ERROR");
       expect(await countBookings()).toBe(0);
+    },
+    30_000,
+  );
+
+  it(
+    "builds the provider callback from WEB_URL and the newly created booking id",
+    async () => {
+      const { holder, holdId } = await setupHold();
+      const webUrl = "https://app.seatsync.test";
+      const webConfig = loadConfig({
+        ...process.env,
+        PAYMENT_PROVIDER: "fake",
+        WEB_URL: webUrl,
+      });
+      const { calls, provider } = recordingProvider();
+
+      const result = await createCheckoutForHold(pool, webConfig, provider, {
+        holdId,
+        userId: holder.id,
+      });
+
+      expect(calls).toHaveLength(1);
+      expect(calls[0]).toEqual({
+        bookingId: result.bookingId,
+        holdId,
+        amountPaise: PRICE_PAISE * 2,
+        callbackUrl: `${webUrl}/bookings/${result.bookingId}`,
+      });
+    },
+    30_000,
+  );
+
+  it(
+    "passes no provider callback when WEB_URL is unset",
+    async () => {
+      const { holder, holdId } = await setupHold();
+      const noWebConfig = loadConfig({
+        ...process.env,
+        PAYMENT_PROVIDER: "fake",
+        WEB_URL: undefined,
+      });
+      const { calls, provider } = recordingProvider();
+
+      const result = await createCheckoutForHold(pool, noWebConfig, provider, {
+        holdId,
+        userId: holder.id,
+      });
+
+      expect(calls).toHaveLength(1);
+      expect(calls[0]).toMatchObject({
+        bookingId: result.bookingId,
+        holdId,
+        amountPaise: PRICE_PAISE * 2,
+      });
+      expect(calls[0]?.callbackUrl).toBeUndefined();
     },
     30_000,
   );

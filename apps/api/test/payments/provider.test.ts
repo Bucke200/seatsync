@@ -114,6 +114,40 @@ function stubRefundResponse(status: number, body: unknown): void {
   })) as unknown as typeof fetch;
 }
 
+interface CapturedRazorpayRequest {
+  url: string;
+  body: unknown;
+}
+
+/**
+ * Stub `global.fetch` with one successful payment-link response and capture
+ * every request so tests can assert on the exact JSON body.
+ */
+function stubCheckoutResponse(): CapturedRazorpayRequest[] {
+  const requests: CapturedRazorpayRequest[] = [];
+
+  global.fetch = jest.fn(
+    async (url: string | URL | Request, init?: RequestInit) => {
+      requests.push({
+        url: String(url),
+        body:
+          typeof init?.body === "string"
+            ? (JSON.parse(init.body) as unknown)
+            : undefined,
+      });
+
+      return {
+        ok: true,
+        status: 200,
+        text: async () =>
+          JSON.stringify({ short_url: "https://rzp.io/rzp/test" }),
+      };
+    },
+  ) as unknown as typeof fetch;
+
+  return requests;
+}
+
 afterEach(() => {
   global.fetch = originalFetch;
 });
@@ -223,6 +257,51 @@ describe("razorpay payment provider", () => {
       bookingId: BOOKING_ID,
       holdId: HOLD_ID,
       paymentRef: "pay_TEST123",
+    });
+  });
+
+  it("sends callback_url and callback_method=get when a callbackUrl is provided", async () => {
+    const requests = stubCheckoutResponse();
+    const callbackUrl = `https://app.seatsync.test/bookings/${BOOKING_ID}`;
+
+    await expect(
+      razorpayProvider().createCheckout({
+        bookingId: BOOKING_ID,
+        holdId: HOLD_ID,
+        amountPaise: 12_500,
+        callbackUrl,
+      }),
+    ).resolves.toEqual({ checkoutUrl: "https://rzp.io/rzp/test" });
+
+    expect(requests).toHaveLength(1);
+    expect(requests[0]?.url).toBe(
+      "https://api.razorpay.com/v1/payment_links",
+    );
+    expect(requests[0]?.body).toEqual({
+      amount: 12_500,
+      currency: "INR",
+      notes: { bookingId: BOOKING_ID, holdId: HOLD_ID },
+      callback_url: callbackUrl,
+      callback_method: "get",
+    });
+  });
+
+  it("omits callback_url and callback_method when no callbackUrl is provided", async () => {
+    const requests = stubCheckoutResponse();
+
+    await expect(
+      razorpayProvider().createCheckout({
+        bookingId: BOOKING_ID,
+        holdId: HOLD_ID,
+        amountPaise: 12_500,
+      }),
+    ).resolves.toEqual({ checkoutUrl: "https://rzp.io/rzp/test" });
+
+    expect(requests).toHaveLength(1);
+    expect(requests[0]?.body).toEqual({
+      amount: 12_500,
+      currency: "INR",
+      notes: { bookingId: BOOKING_ID, holdId: HOLD_ID },
     });
   });
 

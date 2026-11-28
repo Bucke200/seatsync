@@ -48,6 +48,14 @@ const configSchema = z
       .refine((origins) => origins.length > 0, {
         message: "must contain at least one origin",
       }),
+    /**
+     * Doc-unspecified env addition: the hosted web origin. When set, Razorpay
+     * Payment Links receive a `callback_url` so a paid customer lands back on
+     * `<WEB_URL>/bookings/<id>` instead of Razorpay's own confirmation page.
+     * Unset (or blank, dropped by `normalizeEnv`) sends no callback. This only
+     * changes the provider request body; there is no API contract change.
+     */
+    WEB_URL: z.string().url().optional(),
     LIVE_UPDATE_MAX_MS: positiveInteger(1_000),
     RETENTION_DAYS: positiveInteger(30),
   })

@@ -15,8 +15,11 @@ import { emitSeatChange } from "../services/seatEvents";
  * so a provider failure rolls back both inserts and the request can be retried.
  */
 
-/** The config slice the checkout transaction reads (only for diagnostics). */
-export type CheckoutConfig = Pick<Config, "PAYMENT_PROVIDER">;
+/**
+ * The config slice the checkout transaction reads: provider diagnostics plus
+ * the optional web origin used to build the provider callback URL.
+ */
+export type CheckoutConfig = Pick<Config, "PAYMENT_PROVIDER" | "WEB_URL">;
 
 export interface CheckoutForHoldInput {
   holdId: string;
@@ -226,6 +229,16 @@ export async function createCheckoutForHold(
       [booking.id, seats.rows.map((seat) => seat.id)],
     );
 
+    // The booking id exists only after the INSERT, so the callback is built
+    // here from the new row's id. The booking page polls by id and tolerates
+    // the extra query params Razorpay appends; the replay path above never
+    // calls the provider, so it needs no callback. The trailing-slash trim
+    // keeps a configured `https://origin/` from producing `//bookings/...`.
+    const callbackUrl =
+      config.WEB_URL === undefined
+        ? undefined
+        : `${config.WEB_URL.replace(/\/+$/, "")}/bookings/${booking.id}`;
+
     let checkoutUrl: string;
 
     try {
@@ -233,6 +246,7 @@ export async function createCheckoutForHold(
         bookingId: booking.id,
         holdId: input.holdId,
         amountPaise,
+        callbackUrl,
       }));
     } catch {
       // No booking rows may survive a failed provider call; the rollback in the
