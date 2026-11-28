@@ -17,6 +17,17 @@ import { verifyHmacSha256Hex } from "./signature";
  * - Webhook: `X-Razorpay-Signature` is the hex HMAC-SHA256 of the raw body
  *   keyed by `PAYMENT_WEBHOOK_SECRET`, checked with `timingSafeEqual`.
  * - Refund: `POST /v1/payments/:id/refund` with the amount in paise.
+ * - Refund replay: Razorpay has no idempotent refund endpoint. Replaying a
+ *   refund that already succeeded returns HTTP 400 whose
+ *   `error.description` is "The payment has been fully refunded already";
+ *   that 400 IS the idempotent-replay answer, so `refund()` resolves and the
+ *   caller marks the booking REFUNDED instead of retrying forever (D38).
+ *   Every other 400 (insufficient balance, malformed request, ...) stays a
+ *   `PaymentProviderRequestError`.
+ * - Refund throttling: HTTP 429 (and 5xx) stay retryable errors; the retry
+ *   job's existing interval handles them. No in-request `Retry-After` sleep
+ *   is added because `refund()` runs inside the job's row-locking
+ *   transaction, which must not be held open while waiting.
  *
  * Event mapping (Razorpay Payment Links docs, checked 2026-11-28):
  * - `payment_link.paid`      -> `payment_succeeded` (payment id -> paymentRef)
@@ -131,6 +142,35 @@ function readStringField(value: unknown, field: string): string | undefined {
   return typeof fieldValue === "string" && fieldValue.length > 0
     ? fieldValue
     : undefined;
+}
+
+/**
+ * Razorpay's idempotent-replay answer for a refund that already succeeded:
+ * HTTP 400 with `error.description` =
+ * "The payment has been fully refunded already" (observed live 2026-11-28).
+ * The match is a tolerant case-insensitive substring that accepts either word
+ * order (`already refunded` / `refunded already`, with optional `fully`), so
+ * wording tweaks still converge (D38). A literal `/already\s+refunded/` would
+ * miss the observed phrase, whose trailing order is "refunded already".
+ */
+const ALREADY_REFUNDED_DESCRIPTION =
+  /already\s+(?:fully\s+)?refunded|refunded\s+already/i;
+
+function isAlreadyRefundedError(body: unknown): boolean {
+  if (typeof body !== "object" || body === null) {
+    return false;
+  }
+
+  const error = (body as Record<string, unknown>).error;
+  if (typeof error !== "object" || error === null) {
+    return false;
+  }
+
+  const description = (error as Record<string, unknown>).description;
+  return (
+    typeof description === "string" &&
+    ALREADY_REFUNDED_DESCRIPTION.test(description)
+  );
 }
 
 export class RazorpayPaymentProvider implements PaymentProvider {
@@ -274,6 +314,16 @@ export class RazorpayPaymentProvider implements PaymentProvider {
 
     if (!response.ok) {
       const body = await readResponseBody(response);
+
+      // D38: Razorpay has no idempotent refund endpoint, so a replay of a
+      // refund that already succeeded (the retry job's crash window) comes
+      // back as HTTP 400 "The payment has been fully refunded already".
+      // The money is already with the customer: resolve so the caller marks
+      // the booking REFUNDED. Every other 400 keeps failing.
+      if (response.status === 400 && isAlreadyRefundedError(body)) {
+        return;
+      }
+
       throw new PaymentProviderRequestError(
         `Razorpay refund failed (HTTP ${
           response.status

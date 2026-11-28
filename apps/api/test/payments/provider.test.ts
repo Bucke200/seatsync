@@ -1,10 +1,18 @@
 import { createHmac } from "node:crypto";
-import { beforeEach, describe, expect, it } from "@jest/globals";
+import {
+  afterEach,
+  beforeEach,
+  describe,
+  expect,
+  it,
+  jest,
+} from "@jest/globals";
 import {
   createFakeWebhook,
   createPaymentProvider,
   FakePaymentProvider,
   fakePaymentControls,
+  PaymentProviderRequestError,
   RazorpayPaymentProvider,
   signFakeWebhook,
   type PaymentProvider,
@@ -82,6 +90,25 @@ function signRazorpay(rawBody: Buffer): string {
 
 beforeEach(() => {
   fakePaymentControls.reset();
+});
+
+const originalFetch = global.fetch;
+
+/**
+ * Stub `global.fetch` with one refund response. `refund()` reads only `ok`,
+ * `status` and `text()`, so a minimal stand-in avoids depending on undici's
+ * `Response` inside Jest's node environment.
+ */
+function stubRefundResponse(status: number, body: unknown): void {
+  global.fetch = jest.fn(async () => ({
+    ok: status >= 200 && status < 300,
+    status,
+    text: async () => JSON.stringify(body),
+  })) as unknown as typeof fetch;
+}
+
+afterEach(() => {
+  global.fetch = originalFetch;
 });
 
 describe("fake payment provider", () => {
@@ -269,6 +296,56 @@ describe("razorpay payment provider", () => {
     expect(() =>
       razorpayProvider().verifyWebhook(rawBody, signRazorpay(rawBody)),
     ).toThrow(/missing a valid bookingId/);
+  });
+});
+
+describe("razorpay refund", () => {
+  it("treats the 'already fully refunded' 400 as an idempotent replay success (D38)", async () => {
+    stubRefundResponse(400, {
+      error: {
+        code: "BAD_REQUEST_ERROR",
+        description: "The payment has been fully refunded already",
+        source: "business",
+        step: "refund",
+        reason: "payment_refunded",
+      },
+    });
+
+    await expect(
+      razorpayProvider().refund("pay_TEST123", 12_500),
+    ).resolves.toBeUndefined();
+  });
+
+  it("still throws PaymentProviderRequestError for a non-replay 400", async () => {
+    stubRefundResponse(400, {
+      error: {
+        code: "BAD_REQUEST_ERROR",
+        description: "invalid request sent",
+        source: "business",
+        step: "refund",
+        reason: "insufficient_balance",
+      },
+    });
+
+    await expect(
+      razorpayProvider().refund("pay_TEST123", 12_500),
+    ).rejects.toThrow(PaymentProviderRequestError);
+  });
+
+  it("keeps HTTP 429 retryable and surfaces the status code", async () => {
+    stubRefundResponse(429, {
+      error: {
+        code: "BAD_REQUEST_ERROR",
+        description: "Too many requests",
+      },
+    });
+
+    const error = await razorpayProvider()
+      .refund("pay_TEST123", 12_500)
+      .catch((caught: unknown) => caught);
+
+    expect(error).toBeInstanceOf(PaymentProviderRequestError);
+    expect((error as Error).message).toContain("429");
   });
 });
 
