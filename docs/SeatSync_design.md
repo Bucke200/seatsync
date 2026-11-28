@@ -415,7 +415,7 @@ A sprint can start only when every sprint it depends on is merged to `main`. Spr
 | Concurrent requests on the same seats |  | k6 virtual users | 5 |
 | p95 latency for POST /events/:id/holds |  | k6 summary | 5 |
 | Throughput |  | k6 summary, req/s | 5 |
-| Live update latency | 78–80 ms | in-process cross-instance `multi-instance.test.ts`: REST hold via API instance 2 → WS frame on instance 1 through Redis pub/sub, arrival − send over 2 runs (80, 78 ms); browser tab-to-tab across 2 replicas measured post-merge | 4 |
+| Live update latency | ~37–80 ms (in-suite 78–80 ms; browser cross-replica ≤37 ms, tab B flip before originating tab's own recolor) | Both measured post-merge: (1) in-process cross-instance `multi-instance.test.ts` — REST hold via API instance 2 → WS frame on instance 1 through Redis pub/sub, arrival − send over 2 runs (80, 78 ms); (2) real browser tabs across 2 containerized api replicas through nginx — tab B on api-2 recolored 37 ms before tab A (api-1)'s own flip, i.e. cross-replica fan-out ≤37 ms observed; earlier same-replica browser samples were −69/−51 ms | 4 |
 | Test coverage of the API |  | Jest coverage report | 5 |
 
 **Questions to be ready for, and the sprint that answers each**
