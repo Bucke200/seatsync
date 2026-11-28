@@ -11,7 +11,8 @@ import { createRedisClient } from "./realtime/redis";
 import { startSeatEventSubscriber } from "./realtime/subscriber";
 import { attachRealtimeServer } from "./realtime/ws";
 
-const PORT = 4000;
+// D41: Render (and other hosts) inject PORT; local/compose keeps 4000.
+const PORT = Number(process.env.PORT) || 4000;
 
 function main(): void {
   let config: Config;
