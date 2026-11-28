@@ -352,24 +352,24 @@ A sprint can start only when every sprint it depends on is merged to `main`. Spr
 
 **Tasks**
 
-- [ ] Seed script `pnpm --filter api seed:load`: one published event with 50 seats and a pool of attendee accounts whose tokens are written to `load/users.json`
-- [ ] `load/flash-sale.js`: every virtual user tries to hold the same 50 seats, each request with a unique `Idempotency-Key`
-- [ ] `load/mixed.js`: steady browsing (`GET /events`, `GET /events/:id`) mixed with holds and releases
-- [ ] `load/webhook-storm.js`: bursts of duplicate and out-of-order fake-provider webhooks for the same bookings
-- [ ] `load/invariants.sql`: queries that return 0 rows when the data is correct: no seat with more than one `CONFIRMED` booking\_seats row (two PENDING rows are legal — see Rule 3), every `BOOKED` seat matching a `CONFIRMED` booking, and every seat of a `CONFIRMED` booking is `BOOKED`
-- [ ] k6 thresholds in each script: non-409 error rate below 1%, plus a p95 threshold recorded after the first baseline run
-- [ ] EXPLAIN ANALYZE every query on the hold, confirm and event-detail paths; add any missing indexes in a migration
-- [ ] Pool size from `DB_POOL_SIZE`; Redis-backed rate limit on `POST /events/:id/holds` using `HOLDS_RATE_LIMIT_PER_MINUTE` (429 when exceeded)
-- [ ] helmet, a CORS allowlist from `CORS_ORIGINS`, and a JSON body size limit
-- [ ] Optional: cache `GET /events` and `GET /events/:id` in Redis, invalidated on every `seatEvents` change for that event
-- [ ] Jest coverage report uploaded as a CI artifact
+- [x] Seed script `pnpm --filter api seed:load`: one published event with 50 seats and a pool of attendee accounts whose tokens are written to `load/users.json`
+- [x] `load/flash-sale.js`: every virtual user tries to hold the same 50 seats, each request with a unique `Idempotency-Key`
+- [x] `load/mixed.js`: steady browsing (`GET /events`, `GET /events/:id`) mixed with holds and releases
+- [x] `load/webhook-storm.js`: bursts of duplicate and out-of-order fake-provider webhooks for the same bookings
+- [x] `load/invariants.sql`: queries that return 0 rows when the data is correct: no seat with more than one `CONFIRMED` booking\_seats row (two PENDING rows are legal — see Rule 3), every `BOOKED` seat matching a `CONFIRMED` booking, and every seat of a `CONFIRMED` booking is `BOOKED`
+- [x] k6 thresholds in each script: non-409 error rate below 1%, plus a p95 threshold recorded after the first baseline run
+- [x] EXPLAIN ANALYZE every query on the hold, confirm and event-detail paths; add any missing indexes in a migration
+- [x] Pool size from `DB_POOL_SIZE`; Redis-backed rate limit on `POST /events/:id/holds` using `HOLDS_RATE_LIMIT_PER_MINUTE` (429 when exceeded)
+- [x] helmet, a CORS allowlist from `CORS_ORIGINS`, and a JSON body size limit
+- [ ] Optional: cache `GET /events` and `GET /events/:id` in Redis, invalidated on every `seatEvents` change for that event (skipped — see Sprint 5 completion report; D37)
+- [x] Jest coverage report uploaded as a CI artifact
 
 **Acceptance checks**
 
-- `k6 run load/flash-sale.js` passes its thresholds, then `psql "$DATABASE_URL" -f load/invariants.sql` returns 0 rows
-- `k6 run load/webhook-storm.js` passes, and the invariants still return 0 rows
-- Every bug found under load has a regression test in `apps/api/test`
-- The Metrics log has every row filled in, with the k6 options used (virtual users, iterations) and the machine spec
+- [x] `k6 run load/flash-sale.js` passes its thresholds, then `psql "$DATABASE_URL" -f load/invariants.sql` returns 0 rows
+- [x] `k6 run load/webhook-storm.js` passes, and the invariants still return 0 rows
+- [x] Every bug found under load has a regression test in `apps/api/test` (no API-behaviour bug surfaced; the only bug was a k6 threshold-syntax tooling bug fixed in the load scripts — see the completion report)
+- [x] The Metrics log has every row filled in, with the k6 options used (virtual users, iterations) and the machine spec
 
 **Out of scope:** horizontal autoscaling, distributed tracing.
 

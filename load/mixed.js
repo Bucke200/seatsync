@@ -19,8 +19,10 @@ import { Counter, Rate } from "k6/metrics";
  *   - Each VU owns one distinct user and one distinct seat (VU 1 -> seat 0,
  *     ... VU 20 -> seat 19), so holds never contend with another VU's seat.
  *   - `lastHoldAt` enforces a hard 5 000 ms floor between one VU's hold
- *     attempts: 60 s / 5 s = 12 holds/min worst case. The 1.5 s iteration sleep
- *     plus request latency usually brings it to ~8-10/min. Both are < 20/min.
+ *     attempts: 60 s / 5 s = 12 holds/min/VU is the worst case the pacing
+ *     permits (request latency and the 1.5 s iteration sleep can only lower
+ *     it). That worst case is still below the 20/min limit, and the run
+ *     measured zero 429s.
  *   - A 429 is therefore a pacing bug, not an expected outcome.
  *
  * The load API must run with the matching `MAX_SEATS_PER_HOLD` config (default
