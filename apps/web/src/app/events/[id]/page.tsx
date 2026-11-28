@@ -47,6 +47,15 @@ const WS_URL = process.env.NEXT_PUBLIC_WS_URL ?? "ws://localhost:4000/ws";
 const WS_RECONNECT_BASE_DELAY_MS = 1_000;
 const WS_RECONNECT_MAX_DELAY_MS = 15_000;
 
+/**
+ * Identity-guard marker in sessionStorage (per tab, survives a reload). It is
+ * set immediately before a reload that re-renders the page as a different user,
+ * so a session that still cannot authenticate after that reload stops instead
+ * of reloading forever. `subscribed` clears it: a working socket proves the
+ * stored token is usable again.
+ */
+const IDENTITY_RELOAD_FLAG = "seatsync.identityReloaded";
+
 /** The exact spec wording for the "your seat was taken" notice. */
 const SEAT_TAKEN_MESSAGE = "Seat just taken";
 const SEAT_TAKEN_TOAST_MS = 4_000;
@@ -224,6 +233,36 @@ function messageFor(error: unknown): string {
   return error instanceof Error ? error.message : "Something went wrong.";
 }
 
+/**
+ * Read the `sub` claim out of an access token's payload. This is NOT signature
+ * verification — the API already owns that — it only compares the identity the
+ * page was rendered with against the identity a refresh handed back. Tokens are
+ * base64url-encoded JWT segments, so `atob` needs the URL alphabet mapped back
+ * and the padding restored. Any malformed input yields `null` (unknown
+ * identity), which the caller treats as "different" and never adopts silently.
+ */
+function accessTokenSubject(token: string): string | null {
+  const payload = token.split(".")[1];
+
+  if (payload === undefined || payload.length === 0) {
+    return null;
+  }
+
+  try {
+    const base64 = payload.replace(/-/g, "+").replace(/_/g, "/");
+    const padded = base64.padEnd(Math.ceil(base64.length / 4) * 4, "=");
+    const parsed: unknown = JSON.parse(atob(padded));
+
+    if (!isRecord(parsed)) {
+      return null;
+    }
+
+    return typeof parsed.sub === "string" ? parsed.sub : null;
+  } catch {
+    return null;
+  }
+}
+
 export default function EventDetailPage() {
   const params = useParams<{ id: string }>();
   const eventId = params.id;
@@ -346,10 +385,31 @@ export default function EventDetailPage() {
    * effect, so server rendering never opens a socket.
    *
    * Reconnect: on close, wait 1 s → 2 s → 4 s → 8 s → 15 s, then keep retrying
-   * at 15 s. Each attempt refreshes the access token from the httpOnly cookie,
-   * then re-auths, re-subscribes and refetches the snapshot. A failed refresh
-   * means the session is gone: stop the loop and clear the stored token exactly
-   * like `requestJson`'s 401 path, so no dead token keeps going to REST.
+   * at 15 s. A plain reconnect re-authenticates with the token already stored in
+   * sessionStorage; it deliberately does NOT call `/api/auth/refresh`. The
+   * refresh cookie is shared by every tab of the browser profile and holds the
+   * LAST login's token, so refreshing on every reconnect can silently swap this
+   * tab onto another user's identity (observed: tab A reconnected while tab B
+   * had logged in last and adopted B's token). Refresh is therefore reserved for
+   * the one case the protocol signals: the server answers
+   * `{ type: "error", code: "UNAUTHORIZED" }` before closing 1008 on a bad or
+   * expired token, and the NEXT attempt refreshes once. A null refresh keeps
+   * `requestJson`'s logout semantics: clear the stored token and stop.
+   *
+   * Identity guard: the hook captures the `sub` of the token this page rendered
+   * with. After a refresh, a different `sub` is never adopted silently: the tab
+   * stores the fresh token and reloads, so the page renders that identity's data
+   * consistently. A sessionStorage flag allows one such reload per tab; it is
+   * cleared by `subscribed` (auth succeeded), and when it is already set an
+   * identity change stops the loop with a warning instead of reloading again.
+   *
+   * Known limitation (Sprint 1 cookie design): tabs of DIFFERENT users share one
+   * cookie jar, so a reconnect after a real access-token expiry can only
+   * re-authenticate as the LAST login. The identity guard turns that silent
+   * switch into an explicit reload. This reads spec §331 ("on every reconnect,
+   * fetch a fresh access token ... then refetch GET /events/:id")
+   * conservatively: refresh happens when the server actually rejects the token,
+   * and identity changes are never silent.
    */
   useEffect(() => {
     const initialToken = getAccessToken();
@@ -358,11 +418,25 @@ export default function EventDetailPage() {
       return;
     }
 
+    /** The identity this page was rendered with; a refresh must match it. */
+    const initialSub = accessTokenSubject(initialToken);
+    /**
+     * A previous identity reload already re-rendered this tab. The page must
+     * still connect with the stored token (a valid token clears the flag via
+     * `subscribed`; an invalid one is the terminal case below).
+     */
+    let identityReloaded = window.sessionStorage.getItem(IDENTITY_RELOAD_FLAG) === "1";
+
     let stopped = false;
     let socket: WebSocket | null = null;
     let reconnectTimer: number | null = null;
     let attempt = 0;
     let connectionGeneration = 0;
+    /**
+     * The server answered UNAUTHORIZED, so the NEXT reconnect attempt may
+     * refresh. Consumed once per attempt; a plain reconnect never refreshes.
+     */
+    let authRejected = false;
 
     // A different event (effect re-run) must never inherit another map.
     seatVersionsRef.current.clear();
@@ -477,6 +551,10 @@ export default function EventDetailPage() {
             // Only a completed subscribe proves the whole chain works, so the
             // backoff resets here rather than on TCP/WS open.
             attempt = 0;
+            // Auth and subscribe succeeded, so this tab has a usable identity
+            // again; a later identity change may reload once more.
+            identityReloaded = false;
+            window.sessionStorage.removeItem(IDENTITY_RELOAD_FLAG);
             void resyncSnapshot();
           }
           return;
@@ -486,6 +564,13 @@ export default function EventDetailPage() {
           const code = typeof parsed.code === "string" ? parsed.code : "UNKNOWN";
           const message =
             typeof parsed.message === "string" ? parsed.message : "unknown error";
+
+          if (code === "UNAUTHORIZED") {
+            // The server sends this before close 1008 when the token is bad or
+            // expired. Only this rejection earns a refresh on the next attempt;
+            // the close that follows schedules it.
+            authRejected = true;
+          }
 
           console.warn(`SeatSync live updates: server error ${code}: ${message}`);
           return;
@@ -579,6 +664,25 @@ export default function EventDetailPage() {
         return;
       }
 
+      if (!authRejected) {
+        // Plain reconnect: reuse the token this tab already holds. Refreshing
+        // here would authenticate as whichever user logged in last in this
+        // browser profile and silently change this tab's identity.
+        const storedToken = getAccessToken();
+
+        if (storedToken === null) {
+          console.warn("SeatSync live updates: no stored token; reconnect stopped");
+          return;
+        }
+
+        connect(storedToken);
+        return;
+      }
+
+      // Consume the rejection before awaiting: one refresh per auth attempt,
+      // even if the connection drops while the refresh is in flight.
+      authRejected = false;
+
       const token = await refreshAccessToken();
 
       if (stopped) {
@@ -590,6 +694,31 @@ export default function EventDetailPage() {
         // authenticate. Mirror `requestJson`'s 401 path and stop.
         clearAccessToken();
         console.warn("SeatSync live updates: session expired; reconnect stopped");
+        return;
+      }
+
+      const refreshedSub = accessTokenSubject(token);
+
+      if (refreshedSub !== initialSub) {
+        // The shared cookie now belongs to another user. Never adopt that
+        // identity silently: this tab's UI was rendered from `initialSub`'s
+        // data, so a hold or release sent with the new token would act as
+        // someone else. Reload instead, so the page renders the new user's
+        // data consistently from the stored token.
+        console.warn("SeatSync live updates: token refresh changed identity; reloading the page");
+
+        if (identityReloaded) {
+          // The reload after the previous identity change still cannot hold a
+          // session. Reloading again would loop, so stop and leave the warning.
+          console.warn("SeatSync live updates: identity already reloaded once; reconnect stopped");
+          stopped = true;
+          return;
+        }
+
+        // The reloaded page reads this token from sessionStorage.
+        setAccessToken(token);
+        window.sessionStorage.setItem(IDENTITY_RELOAD_FLAG, "1");
+        window.location.reload();
         return;
       }
 
