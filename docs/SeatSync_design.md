@@ -411,12 +411,14 @@ A sprint can start only when every sprint it depends on is merged to `main`. Spr
 
 | Metric | Value | How it was measured | Sprint |
 | --- | --- | --- | --- |
-| Oversells in the flash-sale test |  | k6 scenario A + invariant query | 5 |
-| Concurrent requests on the same seats |  | k6 virtual users | 5 |
-| p95 latency for POST /events/:id/holds |  | k6 summary | 5 |
-| Throughput |  | k6 summary, req/s | 5 |
+| Oversells in the flash-sale test | 0 (no seat with more than one `CONFIRMED` `booking_seats` row; `load/invariants.sql` returned 0 rows after every scenario run, six runs in total) | k6 flash-sale: 200 VUs × 1 iteration, every user racing over the same 50 seats; invariant query against the load database after each run | 5 |
+| Concurrent requests on the same seats | 200 VUs, one hold request each (200 distinct users and `Idempotency-Key`s; 6-seat chunks of the same 50 seats; 7×201 + 193×409 baseline, 6×201 + 194×409 re-run, zero other statuses) | k6 `per-vu-iterations` scenario, `vus: 200, iterations: 1` | 5 |
+| p95 latency for POST /events/:id/holds | 883.73 ms baseline; 404.68 ms on the pinned-threshold re-run; threshold pinned at `p(95)<2000` ms (~2.3× baseline) | k6 flash-sale summary, 200 VUs × 1 iteration per run | 5 |
+| Throughput | 182.52 req/s flash-sale (200 requests in ~1.1 s; 316.38 req/s on the re-run), 30.05 req/s mixed over 90 s, 480.54–497.41 webhook deliveries/s storm (516.58–534.72 total req/s including setup/teardown) | k6 summaries, `http_reqs` rate; a single API container | 5 |
 | Live update latency | ~37–80 ms (in-suite 78–80 ms; browser cross-replica ≤37 ms, tab B flip before originating tab's own recolor) | Both measured post-merge: (1) in-process cross-instance `multi-instance.test.ts` — REST hold via API instance 2 → WS frame on instance 1 through Redis pub/sub, arrival − send over 2 runs (80, 78 ms); (2) real browser tabs across 2 containerized api replicas through nginx — tab B on api-2 recolored 37 ms before tab A (api-1)'s own flip, i.e. cross-replica fan-out ≤37 ms observed; earlier same-replica browser samples were −69/−51 ms | 4 |
-| Test coverage of the API |  | Jest coverage report | 5 |
+| Test coverage of the API | 87.44% statements / 87.43% lines / 64.22% branches / 88.64% functions | `jest --coverage` in CI (`pnpm --filter api test -- --coverage`, artifact uploaded) | 5 |
+
+Sprint 5 load host: AMD Ryzen 5 5600H (6 cores / 12 threads), 15.4 GiB visible RAM (16 GiB physical), Windows 11 Pro for Workstations; API, Postgres and Redis in Docker Desktop containers, k6 in a `grafana/k6` container on the same host. The mixed scenario used 20 VUs for 90 s (`constant-vus`, 1200 iterations); the webhook storm used 20 VUs / 200 shared iterations. The API container ran with `PAYMENT_PROVIDER=fake` and `DB_POOL_SIZE=20`.
 
 **Questions to be ready for, and the sprint that answers each**
 

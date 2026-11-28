@@ -23,13 +23,19 @@ import { Counter, Rate } from "k6/metrics";
  *     plus request latency usually brings it to ~8-10/min. Both are < 20/min.
  *   - A 429 is therefore a pacing bug, not an expected outcome.
  *
+ * The load API must run with the matching `MAX_SEATS_PER_HOLD` config (default
+ * 6, read from `__ENV.MAX_SEATS_PER_HOLD` below). This scenario holds ONE seat
+ * per pass, so it only requires the server cap to be at least that.
+ *
  * Expected statuses: GETs 200, hold 201 (or 409 if a previous release failed),
  * release 204. Every other status — including 429 and 422 — is counted by
  * `mixed_unexpected_rate`, which must stay below 1 %. In addition
  * `rate_limit_hits` must be exactly 0, so even a single 429 fails the run
  * (the 1 % rate alone would hide a lone 429 among thousands of requests).
  *
- * P95 placeholder: conservative pre-baseline guess, pinned in Step 5.
+ * P95 pinned from the Step 5 baseline: observed 22.17 ms across all mixed
+ * requests, so the ceiling is 50 ms (~2.3x) — tight enough to catch a browsing
+ * or hold-regression while leaving room for a sweeper tick.
  *
  * Run:
  *   docker run --rm -v "${PWD}/load:/load" -i \
@@ -45,9 +51,18 @@ const users = new SharedArray("load-users", () => seed.users);
 
 const BASE_URL = (__ENV.API_BASE_URL || "http://localhost:4000").replace(/\/+$/, "");
 const HOLD_INTERVAL_MS = 5_000;
+// The chunk size must match the load API's MAX_SEATS_PER_HOLD config (default 6).
+// This scenario holds one seat per pass; the guard catches a server configured
+// below that (which would turn every hold into a 422).
+const MAX_SEATS_PER_HOLD = Number(__ENV.MAX_SEATS_PER_HOLD ?? "6");
 
-// TODO(step 5): replace with the p95 measured in the first baseline run.
-const P95_REQUEST_LATENCY_MS = 500;
+if (!Number.isInteger(MAX_SEATS_PER_HOLD) || MAX_SEATS_PER_HOLD < 1) {
+  throw new Error(`MAX_SEATS_PER_HOLD must be a positive integer, got ${__ENV.MAX_SEATS_PER_HOLD}`);
+}
+
+// Pinned from the Step 5 baseline: observed p95 22.17 ms over all requests.
+// 50 ms is ~2.3x the baseline.
+const P95_REQUEST_LATENCY_MS = 50;
 
 const mixedUnexpected = new Rate("mixed_unexpected_rate");
 const rateLimitHits = new Counter("rate_limit_hits");
@@ -71,7 +86,7 @@ export const options = {
   thresholds: {
     mixed_unexpected_rate: ["rate<0.01"],
     rate_limit_hits: ["count==0"],
-    http_req_duration: [`p95<${P95_REQUEST_LATENCY_MS}`],
+    http_req_duration: [`p(95)<${P95_REQUEST_LATENCY_MS}`],
     checks: ["rate>0.99"],
   },
 };

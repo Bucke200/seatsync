@@ -29,7 +29,9 @@ import { Counter, Rate } from "k6/metrics";
  *                             DIFFERENT eventIds and race each other; whichever
  *                             lands first wins, the other is still processed on
  *                             its own (late payment after expiry -> refund).
- *   4. expiry-after-payment:  same two events as 3, so both orderings occur.
+ *   4. expiry-after-payment:  its own independent pair of eventIds
+ *                             (`-after-pay` / `-after-expire`), also racing each
+ *                             other; both orderings occur across its deliveries.
  *   5. pay-replays:           payment_succeeded with a UNIQUE eventId per
  *                             delivery x ~40 -> first confirms, the rest hit the
  *                             terminal CONFIRMED booking and commit as 200
@@ -46,7 +48,8 @@ import { Counter, Rate } from "k6/metrics";
  * that returns 200 but leaves a booking PENDING fails
  * `webhook_booking_state_ok` (rate == 1).
  *
- * P95 placeholder: conservative pre-baseline guess, pinned in Step 5.
+ * P95 pinned from the Step 5 baseline: observed 77.03 ms over all HTTP requests
+ * (storm + setup + teardown), so the ceiling is 200 ms (~2.6x).
  *
  * Run (needs a freshly seeded event; seats 0-4 must be AVAILABLE):
  *   docker run --rm -v "${PWD}/load:/load" -i \
@@ -64,8 +67,9 @@ const BASE_URL = (__ENV.API_BASE_URL || "http://localhost:4000").replace(/\/+$/,
 const PROVIDER = __ENV.PAYMENT_PROVIDER || "fake";
 const WEBHOOK_SECRET = __ENV.PAYMENT_WEBHOOK_SECRET || "";
 
-// TODO(step 5): replace with the p95 measured in the first baseline run.
-const P95_WEBHOOK_LATENCY_MS = 1000;
+// Pinned from the Step 5 baseline: observed p95 77.03 ms over all requests.
+// 200 ms is ~2.6x the baseline.
+const P95_WEBHOOK_LATENCY_MS = 200;
 
 const BOOKING_RECIPES = [
   "pay-same-event",
@@ -101,7 +105,7 @@ export const options = {
   thresholds: {
     webhook_unexpected_rate: ["rate<0.01"],
     webhook_booking_state_ok: ["rate==1"],
-    http_req_duration: [`p95<${P95_WEBHOOK_LATENCY_MS}`],
+    http_req_duration: [`p(95)<${P95_WEBHOOK_LATENCY_MS}`],
     checks: ["rate>0.99"],
   },
 };

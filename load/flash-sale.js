@@ -13,14 +13,17 @@ import { Counter, Rate } from "k6/metrics";
  * unique `Idempotency-Key` per hold attempt.
  *
  * Pool interpretation (doc-unspecified, recorded in the completion report):
- * `MAX_SEATS_PER_HOLD` is 6, so "hold the same 50 seats" cannot mean one
- * request with all 50 ids (that is a guaranteed 422 for every VU). Instead each
- * VU attempts to hold a successive 6-seat chunk of the shared 50-seat pool.
- * Chunks 0-7 tile seats 0-47 disjointly and chunk 8 wraps onto seats 48-49 and
- * 0-3, so the first ~8-9 chunks to commit win and every later chunk collides
- * with at least one held seat and loses atomically with 409. The expected mix is
- * therefore ~8-9 x 201 and ~191 x 409, with no partial holds and no other
- * statuses.
+ * `MAX_SEATS_PER_HOLD` (default 6, read from the same `__ENV.MAX_SEATS_PER_HOLD`
+ * here; the load API must run with the matching config) means "hold the same 50
+ * seats" cannot be one request with all 50 ids (that is a guaranteed 422 for
+ * every VU). Instead each VU attempts to hold a successive chunk of that size
+ * from the shared 50-seat pool. With the default 6, chunks 0-7 tile seats 0-47
+ * disjointly and any later chunk wraps onto seats already held, so at most 8
+ * chunks can win (a 6-seat chunk cannot occupy just seats 48-49); the rest lose
+ * atomically with 409. Concurrency makes the wrapped chunk preempt one of the
+ * tiling chunks some of the time, so the expected mix is typically 6-8 x 201 and
+ * ~192-194 x 409 (baseline: 7 x 201 / 193 x 409; pinned-threshold rerun: 6/194),
+ * with no partial holds and no other statuses.
  *
  * Expected statuses: 201 (winner), 409 (SEATS_UNAVAILABLE loser), plus 422/429
  * as contract-valid refusals. 422 would mean the request shape/count is wrong
@@ -28,8 +31,9 @@ import { Counter, Rate } from "k6/metrics";
  * treats both as expected; the custom `unexpected_status_rate` counts ONLY
  * responses that are none of 201/409/422/429. Threshold: < 1 %.
  *
- * P95 placeholder: the value below is a conservative pre-baseline guess and is
- * pinned to the measured p95 in Step 5.
+ * P95 pinned from the Step 5 baseline: observed 883.73 ms across the 200-VU
+ * burst, so the ceiling is 2000 ms (~2.3x) to tolerate scheduling noise while
+ * still catching a real regression.
  *
  * Run (users.json is gitignored and read relative to this script):
  *   docker run --rm -v "${PWD}/load:/load" -i \
@@ -44,11 +48,13 @@ const seed = JSON.parse(open("./users.json"));
 const users = new SharedArray("load-users", () => seed.users);
 
 const BASE_URL = (__ENV.API_BASE_URL || "http://localhost:4000").replace(/\/+$/, "");
-const MAX_SEATS_PER_HOLD = 6;
+// The chunk size must match the load API's MAX_SEATS_PER_HOLD config (default 6).
+const MAX_SEATS_PER_HOLD = Number(__ENV.MAX_SEATS_PER_HOLD ?? "6");
 const EXPECTED_STATUSES = [201, 409, 422, 429];
 
-// TODO(step 5): replace with the p95 measured in the first baseline run.
-const P95_HOLD_LATENCY_MS = 1000;
+// Pinned from the Step 5 baseline: observed p95 883.73 ms under 200 VUs.
+// 2000 ms is ~2.3x the baseline — round, noise-tolerant, still regression-catching.
+const P95_HOLD_LATENCY_MS = 2000;
 
 const unexpectedStatus = new Rate("unexpected_status_rate");
 const holdsWon = new Counter("holds_won");
@@ -66,7 +72,7 @@ export const options = {
   },
   thresholds: {
     unexpected_status_rate: ["rate<0.01"],
-    http_req_duration: [`p95<${P95_HOLD_LATENCY_MS}`],
+    http_req_duration: [`p(95)<${P95_HOLD_LATENCY_MS}`],
     checks: ["rate>0.99"],
   },
 };

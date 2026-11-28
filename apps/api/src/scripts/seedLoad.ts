@@ -90,19 +90,25 @@ async function insertAttendees(
 ): Promise<Array<{ email: string; userId: string; token: string }>> {
   const emails: string[] = [];
   const placeholders: string[] = [];
+  const values: string[] = [];
 
-  // D11: ONE INSERT for every attendee, even though each tuple carries its own
-  // bound email parameter. The role and placeholder hash are constants.
+  // D11: ONE INSERT for every attendee. Every value is bound (3 parameters per
+  // tuple), including the constant placeholder hash and role: no SQL string
+  // interpolation of data, constants or otherwise.
   for (let index = 0; index < ATTENDEE_COUNT; index += 1) {
-    emails.push(`load-vu-${index}-${timestamp}@load.local`);
-    placeholders.push(`($${index + 1}, '${PLACEHOLDER_PASSWORD_HASH}', 'ATTENDEE')`);
+    const email = `load-vu-${index}-${timestamp}@load.local`;
+    const emailParam = index * 3 + 1;
+
+    emails.push(email);
+    placeholders.push(`($${emailParam}, $${emailParam + 1}, $${emailParam + 2})`);
+    values.push(email, PLACEHOLDER_PASSWORD_HASH, "ATTENDEE");
   }
 
   const inserted = await pool.query<InsertedUserRow>(
     `INSERT INTO users (email, password_hash, role)
      VALUES ${placeholders.join(", ")}
      RETURNING id, email`,
-    emails,
+    values,
   );
 
   if (inserted.rows.length !== ATTENDEE_COUNT) {
