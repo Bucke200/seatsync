@@ -295,8 +295,9 @@ Runtime environment variables:
   settings work with the pnpm workspace). Then add an account token as
   `VERCEL_TOKEN` and copy **Org ID** and **Project ID** from **Settings →
   General** into the GitHub secrets `VERCEL_ORG_ID` and `VERCEL_PROJECT_ID`.
-  The workflow runs `vercel deploy --prod --yes` from `apps/web`; the CLI links
-  the fresh checkout to the existing project from those env values (no
+  The workflow runs `vercel deploy --prod --yes` from the repository root and
+  lets the project's Root Directory select `apps/web`; the CLI links the fresh
+  checkout to the existing project from those env values (no
   `.vercel/project.json` is committed) and supplies `API_PROXY_TARGET` and
   `NEXT_PUBLIC_WS_URL` as build environment values, so they do not need to be
   configured in the dashboard. Both are derived from the single

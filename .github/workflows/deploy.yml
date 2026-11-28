@@ -195,8 +195,12 @@ jobs:
       #
       # NEXT_PUBLIC_WS_URL must be a WebSocket URL (ws:// or wss://), so its
       # scheme is derived from RENDER_API_URL rather than copied verbatim.
+      #
+      # Run from the repository root: the Vercel project's dashboard Root
+      # Directory is already apps/web, and the CLI resolves it relative to the
+      # working directory (a working-directory of apps/web would resolve
+      # apps/web/apps/web and fail).
       - name: Deploy web to Vercel (production)
-        working-directory: apps/web
         env:
           # The CLI links the checkout to an existing project from these env
           # values alone; no .vercel/project.json is needed on a fresh runner.
