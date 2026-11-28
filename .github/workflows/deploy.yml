@@ -1,0 +1,260 @@
+name: Deploy
+
+# D39: production deploys only from main. ci.yml ignores main pushes, so the
+# extra tests that run for this workflow are the ones inside the `ci` job below.
+on:
+  push:
+    branches: [main]
+
+jobs:
+  # D39: GitHub Actions `needs:` is intra-workflow only, so a separate
+  # deploy.yml cannot literally depend on the `ci` job in ci.yml. This job is
+  # therefore a full copy of ci.yml's gate, and `deploy` declares `needs: ci`.
+  # If any step here fails, GitHub skips `deploy` (spec section 396).
+  #
+  # Keep this job in sync with .github/workflows/ci.yml.
+  ci:
+    name: Lint, typecheck, migrate and test
+    runs-on: ubuntu-latest
+
+    # upload-artifact@v4 needs actions: write to create the coverage artifact;
+    # everything else here only reads the repository.
+    permissions:
+      contents: read
+      actions: write
+
+    # The workflow's own env vars win over the (absent in CI) repo-root .env
+    # because every api script loads it with --env-file-if-exists.
+    env:
+      DATABASE_URL: postgres://seatsync:seatsync@localhost:5432/seatsync
+      REDIS_URL: redis://localhost:6379
+      JWT_SECRET: ci-jwt-secret
+      PAYMENT_WEBHOOK_SECRET: ci-webhook-secret
+
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: seatsync
+          POSTGRES_PASSWORD: seatsync
+          POSTGRES_DB: seatsync
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U seatsync -d seatsync"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
+      redis:
+        image: redis:7
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 12
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          # Keep in sync with the root package.json "packageManager" pin.
+          version: 10.8.1
+
+      - name: Set up Node 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Lint
+        run: pnpm lint
+
+      - name: Typecheck
+        run: pnpm typecheck
+
+      # Exercise both directions of the migration runner before the test suite,
+      # leaving the schema applied so integration tests have a users table.
+      - name: Migrate up
+        run: pnpm --filter api migrate up
+
+      - name: Migrate down
+        run: pnpm --filter api migrate down
+
+      - name: Migrate up again
+        run: pnpm --filter api migrate up
+
+      - name: Test
+        run: pnpm test
+
+      # D35: report-only coverage artifact. No thresholds are enforced yet
+      # (ratchet later once a baseline is stable).
+      - name: Coverage
+        run: pnpm --filter api test --coverage
+
+      - name: Upload coverage artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: api-coverage
+          path: apps/api/coverage/
+          retention-days: 14
+          if-no-files-found: error
+
+  deploy:
+    name: Release migrations and deploy API + web
+    needs: ci
+    runs-on: ubuntu-latest
+
+    # Least privilege: the release reads the repository and deploys outwards.
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # Fail before doing any release work if a secret the workflow uses is
+      # missing. RENDER_API_URL is the single source of truth for the API host:
+      # it feeds both web build-time values and the post-deploy smoke test.
+      - name: Guard required deploy secrets
+        env:
+          RENDER_API_URL: ${{ secrets.RENDER_API_URL }}
+          PROD_DATABASE_URL: ${{ secrets.PROD_DATABASE_URL }}
+          PROD_REDIS_URL: ${{ secrets.PROD_REDIS_URL }}
+          PROD_JWT_SECRET: ${{ secrets.PROD_JWT_SECRET }}
+          PAYMENT_WEBHOOK_SECRET: ${{ secrets.PAYMENT_WEBHOOK_SECRET }}
+          RENDER_DEPLOY_HOOK_URL: ${{ secrets.RENDER_DEPLOY_HOOK_URL }}
+          VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+          VERCEL_ORG_ID: ${{ secrets.VERCEL_ORG_ID }}
+          VERCEL_PROJECT_ID: ${{ secrets.VERCEL_PROJECT_ID }}
+        run: |
+          set -euo pipefail
+          missing=0
+          for name in RENDER_API_URL PROD_DATABASE_URL PROD_REDIS_URL PROD_JWT_SECRET PAYMENT_WEBHOOK_SECRET RENDER_DEPLOY_HOOK_URL VERCEL_TOKEN VERCEL_ORG_ID VERCEL_PROJECT_ID; do
+            if [ -z "${!name}" ]; then
+              echo "::error::$name is empty. Set it in Settings > Secrets and variables > Actions (see README Deploy section)."
+              missing=1
+            fi
+          done
+          exit "$missing"
+
+      - name: Set up pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10.8.1
+
+      - name: Set up Node 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      # D40 step 1: migrations run as a release step, before the new API image
+      # starts. This uses the Neon direct (unpooled) URL because node-pg-migrate
+      # relies on session-level advisory locks.
+      - name: Release migrations (Neon direct URL)
+        env:
+          DATABASE_URL: ${{ secrets.PROD_DATABASE_URL }}
+        run: pnpm --filter api migrate up
+
+      # D40 step 2: Render builds and starts the API image asynchronously. A
+      # deploy hook returns a deploy object; 200, 201 and 202 all mean queued.
+      - name: Trigger Render API deploy
+        env:
+          RENDER_DEPLOY_HOOK_URL: ${{ secrets.RENDER_DEPLOY_HOOK_URL }}
+        run: |
+          set -euo pipefail
+          response="$(curl -fsSL -X POST -w $'\n%{http_code}' "$RENDER_DEPLOY_HOOK_URL")"
+          http_code="${response##*$'\n'}"
+          body="${response%$'\n'*}"
+          printf 'Render deploy hook HTTP %s\n%s\n' "$http_code" "$body"
+          case "$http_code" in
+            200|201|202) ;;
+            *)
+              echo "::error::Render deploy hook returned HTTP $http_code (expected 200, 201 or 202)."
+              exit 1
+              ;;
+          esac
+
+      - name: Install Vercel CLI
+        run: npm install --global vercel@latest
+
+      # D40 step 3: API_PROXY_TARGET and NEXT_PUBLIC_WS_URL are baked into the
+      # Next build, so the web app is built only after the Render API URL is
+      # known. Both derive from the one RENDER_API_URL secret.
+      #
+      # NEXT_PUBLIC_WS_URL must be a WebSocket URL (ws:// or wss://), so its
+      # scheme is derived from RENDER_API_URL rather than copied verbatim.
+      - name: Deploy web to Vercel (production)
+        working-directory: apps/web
+        env:
+          # The CLI links the checkout to an existing project from these env
+          # values alone; no .vercel/project.json is needed on a fresh runner.
+          VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+          VERCEL_ORG_ID: ${{ secrets.VERCEL_ORG_ID }}
+          VERCEL_PROJECT_ID: ${{ secrets.VERCEL_PROJECT_ID }}
+          RENDER_API_URL: ${{ secrets.RENDER_API_URL }}
+        run: |
+          set -euo pipefail
+          api_url="${RENDER_API_URL%/}"
+          if [ -z "$api_url" ]; then
+            echo "::error::RENDER_API_URL is empty; refusing to build the web app against an unknown API host."
+            exit 1
+          fi
+          ws_url="$(printf '%s' "$api_url" | sed -e 's|^https://|wss://|' -e 's|^http://|ws://|')/ws"
+          echo "API_PROXY_TARGET=$api_url"
+          echo "NEXT_PUBLIC_WS_URL=$ws_url"
+          vercel deploy --prod --yes \
+            --token="$VERCEL_TOKEN" \
+            --build-env "API_PROXY_TARGET=$api_url" \
+            --build-env "NEXT_PUBLIC_WS_URL=$ws_url"
+
+      # The Render hook only queues the deploy. Wait for the live API to report
+      # Postgres and Redis healthy before seeding and smoke-testing it.
+      - name: Wait for Render API health
+        env:
+          RENDER_API_URL: ${{ secrets.RENDER_API_URL }}
+        run: |
+          set -euo pipefail
+          api_url="${RENDER_API_URL%/}"
+          for attempt in $(seq 1 60); do
+            status="$(curl -sS -o /dev/null -w '%{http_code}' --max-time 10 "$api_url/health" || true)"
+            if [ "$status" = "200" ]; then
+              echo "Render API healthy after attempt $attempt: $api_url/health"
+              exit 0
+            fi
+            echo "attempt $attempt/60: $api_url/health returned ${status:-no response}; retrying in 10s"
+            sleep 10
+          done
+          echo "::error::Render API did not become healthy at $api_url/health within 10 minutes."
+          exit 1
+
+      # The smoke test logs in as the demo attendee and needs the demo event.
+      # seed:demo is idempotent; PAYMENT_PROVIDER=fake keeps this config load
+      # free of provider keys because the seed script never touches payments.
+      - name: Seed demo data (idempotent)
+        env:
+          DATABASE_URL: ${{ secrets.PROD_DATABASE_URL }}
+          REDIS_URL: ${{ secrets.PROD_REDIS_URL }}
+          JWT_SECRET: ${{ secrets.PROD_JWT_SECRET }}
+          PAYMENT_WEBHOOK_SECRET: ${{ secrets.PAYMENT_WEBHOOK_SECRET }}
+          PAYMENT_PROVIDER: fake
+        run: pnpm --filter api seed:demo
+
+      # End-to-end proof of the deploy, run from the workflow itself. Against a
+      # razorpay prod API the checkout URL is a real rzp.io link: smoke only
+      # asserts it is non-empty and never follows it, so no money moves.
+      - name: Smoke test deployed API
+        env:
+          RENDER_API_URL: ${{ secrets.RENDER_API_URL }}
+        run: bash scripts/smoke.sh "${RENDER_API_URL%/}"

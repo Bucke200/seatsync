@@ -1,1 +1,3 @@
 * text=auto eol=lf
+# Sprint 6 (D43): keep smoke.sh LF explicitly so git-bash/Ubuntu never see \r.
+scripts/*.sh text eol=lf
