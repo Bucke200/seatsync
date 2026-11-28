@@ -30,6 +30,31 @@ export function asyncHandler(
   };
 }
 
+/**
+ * body-parser's `PayloadTooLargeError` (http-errors) marks itself with
+ * `type: "entity.too.large"` and exposes the status as both `status` and
+ * `statusCode`. Check all three so both `express.json({ limit })` and
+ * `express.raw({ limit })` overruns are recognised regardless of which alias
+ * body-parser populates.
+ */
+function isPayloadTooLarge(error: unknown): boolean {
+  if (!(error instanceof Error)) {
+    return false;
+  }
+
+  const candidate = error as Error & {
+    type?: unknown;
+    status?: unknown;
+    statusCode?: unknown;
+  };
+
+  return (
+    candidate.type === "entity.too.large" ||
+    candidate.status === 413 ||
+    candidate.statusCode === 413
+  );
+}
+
 function toResponse(error: ApiError): ErrorResponse {
   const response: ErrorResponse = {
     error: {
@@ -71,6 +96,18 @@ export function errorHandler(
         code: "VALIDATION_ERROR",
         message: "Request validation failed",
         details: error.issues,
+      },
+    } satisfies ErrorResponse);
+    return;
+  }
+
+  // Body-size limits (express.json and express.raw) are client errors with a
+  // stable shape, not unexpected failures; do not log the rejected body.
+  if (isPayloadTooLarge(error)) {
+    res.status(413).json({
+      error: {
+        code: "PAYLOAD_TOO_LARGE",
+        message: "Request body too large",
       },
     } satisfies ErrorResponse);
     return;
