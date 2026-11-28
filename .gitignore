@@ -25,6 +25,10 @@ coverage/
 npm-debug.log*
 pnpm-debug.log*
 
+# Load-test artifacts (generated tokens must never be committed)
+load/users.json
+load/*.log
+
 # Editor and OS files
 .vscode/
 .idea/
