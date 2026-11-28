@@ -127,6 +127,50 @@ To use Razorpay, set `PAYMENT_PROVIDER=razorpay` together with `RAZORPAY_KEY_ID`
 
 **Blocked — Human:** in the Razorpay sandbox, pay with a test card and then resend the same webhook event from the Razorpay CLI or dashboard; the booking must not change. This live card + resend check is still pending real sandbox keys.
 
+## Multi-instance scale stack (Sprint 4)
+
+`docker-compose.scale.yml` verifies that the realtime seat map works across more than one API process: two `api` replicas share one Postgres and one Redis, sit behind `nginx` (which round-robins Docker DNS A-records and forwards WebSocket `Upgrade` headers), and a client on one replica receives changes committed through another replica via Redis pub/sub. It is a **standalone** compose file, not an override: the `seatsync-scale` project has its own database, Redis and named volume, so it can run beside the normal development stack without touching it.
+
+Host ports are deliberately shifted so both stacks can run at once (`SCALE_DB_PORT`, `SCALE_REDIS_PORT`, `NGINX_PORT`, `WEB_PORT` override them):
+
+| Service | Scale stack | Normal stack |
+| --- | --- | --- |
+| API HTTP + WS | `http://localhost:4010` (nginx) | `http://localhost:4000` (api) |
+| Web | `http://localhost:3010` | `http://localhost:3000` |
+| Postgres | `localhost:5435` | `localhost:5434` |
+| Redis | `localhost:6380` | `localhost:6379` |
+
+Migrations run **exactly once** per boot: the one-shot `migrate` service applies them and exits, and both replicas wait for `service_completed_successfully`. The replica command is `node --import tsx src/server.ts`, deliberately skipping migrate-on-boot so two processes can never race `node-pg-migrate`. To apply migrations without starting the stack:
+
+```bash
+docker compose -f docker-compose.scale.yml -p seatsync-scale run --rm migrate
+```
+
+Boot it (the migrate step above runs automatically; `--scale api=2` starts the two replicas):
+
+```bash
+docker compose -f docker-compose.scale.yml -p seatsync-scale up -d --build --scale api=2
+```
+
+Verify it:
+
+```bash
+curl.exe -s -o NUL -w "%{http_code}" http://localhost:4010/health
+# 200 — the access log records upstream=<replica-ip>:4000; repeat the request
+# and the two upstream addresses prove nginx is balancing both replicas
+docker compose -f docker-compose.scale.yml -p seatsync-scale ps
+docker compose -f docker-compose.scale.yml -p seatsync-scale logs nginx
+```
+
+The browser connects its WebSocket directly to `ws://localhost:4010/ws` (nginx proxies `Upgrade`/`Connection` with a one-hour idle read timeout); REST goes through the web app's `/api/*` proxy or straight to `http://localhost:4010`. Because the browser cannot use a compose hostname, the WS URL names the host-visible nginx port, not `api:4000`.
+
+Tear it down completely, including only the scale project's own volume:
+
+```bash
+docker compose -f docker-compose.scale.yml -p seatsync-scale down -v
+docker volume ls   # seatsync_pgdata (the normal stack's volume) is still there
+```
+
 ## CI
 
 `.github/workflows/ci.yml` runs on every push (all branches) and on pull requests. A single Ubuntu job uses Node.js 22 and pnpm 10.8.1, with `postgres:16` and `redis:7` service containers, then runs `pnpm install --frozen-lockfile`, `pnpm lint`, `pnpm typecheck`, `pnpm --filter api migrate up`, `pnpm --filter api migrate down`, `pnpm --filter api migrate up` and `pnpm test`. CI uses the standard Postgres port 5432 because the hosted runner is clean; local development uses 5434 (see below).

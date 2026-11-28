@@ -1,0 +1,159 @@
+name: seatsync-scale
+
+# Sprint 4 multi-instance scale stack (D31, design.md:334).
+#
+# This is a STANDALONE compose file, deliberately not an override of
+# docker-compose.yml: it has its own Postgres, Redis and volumes, so it can run
+# beside the normal development stack without touching it. Host ports differ
+# from the base file so nothing collides:
+#
+#   db      host ${SCALE_DB_PORT:-5435}    (base: 5434)
+#   redis   host ${SCALE_REDIS_PORT:-6380} (base: 6379)
+#   nginx   host ${NGINX_PORT:-4010}       (base api: 4000)
+#   web     host ${WEB_PORT:-3010}         (base: 3000)
+#
+# Doc-unspecified choices recorded here: (1) the scale stack is self-contained
+# (own db/redis/volumes) instead of reusing the running dev stack's services,
+# because a verification run may truncate data; (2) host ports are shifted via
+# the variables above so the two stacks can run at the same time; (3) WebSocket
+# clients connect to ws://localhost:${NGINX_PORT:-4010}/ws — nginx is the only
+# path to the replicas, which expose no host ports.
+#
+# Migrations run exactly once: the one-shot `migrate` service applies them and
+# exits, and both `api` replicas wait for `condition:
+# service_completed_successfully` before starting. The api command deliberately
+# skips migrate-on-boot (unlike docker-compose.yml) so two replicas can never
+# race node-pg-migrate. `docker compose ... up` therefore needs no manual step;
+# `docker compose -f docker-compose.scale.yml -p seatsync-scale run --rm migrate`
+# applies migrations only.
+#
+# Boot two replicas with:
+#   docker compose -f docker-compose.scale.yml -p seatsync-scale \
+#     up -d --build --scale api=2
+# Tear down (including this project's own volumes) with:
+#   docker compose -p seatsync-scale down -v
+
+x-api-image: &api-image
+  build:
+    context: .
+    dockerfile: apps/api/Dockerfile
+  image: seatsync-scale-api
+
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-seatsync}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-seatsync}
+      POSTGRES_DB: ${POSTGRES_DB:-seatsync}
+    ports:
+      - "${SCALE_DB_PORT:-5435}:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U \"$$POSTGRES_USER\" -d \"$$POSTGRES_DB\""]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 5s
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "${SCALE_REDIS_PORT:-6380}:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+    restart: unless-stopped
+
+  # One-shot migration service: exactly one process applies the schema, and the
+  # api replicas below cannot start until it exits successfully.
+  migrate:
+    <<: *api-image
+    env_file:
+      - .env
+    environment:
+      DATABASE_URL: postgres://${POSTGRES_USER:-seatsync}:${POSTGRES_PASSWORD:-seatsync}@db:5432/${POSTGRES_DB:-seatsync}
+    command:
+      - node
+      - node_modules/node-pg-migrate/bin/node-pg-migrate.js
+      - -m
+      - migrations
+      - -d
+      - DATABASE_URL
+      - up
+    depends_on:
+      db:
+        condition: service_healthy
+    restart: "no"
+
+  api:
+    <<: *api-image
+    env_file:
+      - .env
+    environment:
+      NODE_ENV: production
+      # In-network addresses override the host values from .env.
+      DATABASE_URL: postgres://${POSTGRES_USER:-seatsync}:${POSTGRES_PASSWORD:-seatsync}@db:5432/${POSTGRES_DB:-seatsync}
+      REDIS_URL: redis://redis:6379
+    # No host `ports:`: every replica is reached through nginx only, so two
+    # replicas (or `--scale api=N`) can never fight over a host port.
+    command: ["node", "--import", "tsx", "src/server.ts"]
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "node",
+          "-e",
+          "fetch('http://127.0.0.1:4000/health').then((r) => process.exit(r.status === 200 ? 0 : 1)).catch(() => process.exit(1))",
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
+    restart: unless-stopped
+
+  nginx:
+    image: nginx:1.27-alpine
+    ports:
+      - "${NGINX_PORT:-4010}:4000"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+    depends_on:
+      api:
+        condition: service_started
+    restart: unless-stopped
+
+  web:
+    build:
+      context: .
+      dockerfile: apps/web/Dockerfile
+      args:
+        # Next bakes the rewrite destination at build time (same as base).
+        API_PROXY_TARGET: http://api:4000
+    environment:
+      # Next's server-side /api/* proxy resolves `api` through Docker DNS, which
+      # returns both replica addresses. The browser's WebSocket URL is different:
+      # it must name the host-visible nginx port (ws://localhost:${NGINX_PORT}/ws).
+      API_PROXY_TARGET: http://api:4000
+    ports:
+      - "${WEB_PORT:-3010}:3000"
+    depends_on:
+      api:
+        condition: service_started
+    restart: unless-stopped
+
+volumes:
+  # Project-scoped by compose (`seatsync-scale_pgdata`): down -v can never
+  # remove the development stack's `seatsync_pgdata` volume.
+  pgdata:
