@@ -219,6 +219,30 @@ development host: they catch regressions on the same machine, not a universal
 latency SLO. Full narratives are in the Sprint 5 section and the Metrics log in
 `docs/SeatSync_design.md`.
 
+## Resume highlights
+
+- **Zero oversells under a 200-VU flash sale.** Seat holds are PostgreSQL
+  conditional `UPDATE`s over row-locked seats with a TTL sweeper, backed by a
+  partial unique index; Redis is used only for pub/sub fan-out, rate limiting
+  and caching, never for correctness. 200 virtual users raced for the same 50
+  seats: 7×`201` + 193×`409` (6 + 194 on the re-run), zero 5xx, and the
+  `load/invariants.sql` checks returned **0 rows** after all six load runs.
+- **Measured p95 and throughput.** `POST /events/:id/holds` p95 was
+  **883.73 ms** on the baseline 200-VU run and **404.68 ms** after query and
+  index tuning, at **182–316 req/s** on one API container; a duplicate/late
+  webhook storm sustained **~480–497 deliveries/s** with **zero
+  double-confirms**.
+- **Live seat map at ≤37 ms across replicas.** WebSocket fan-out over Redis
+  pub/sub — published only after `COMMIT`, with per-seat version filtering —
+  reached a second real browser tab in **≤37 ms** across two API replicas.
+- **33 test suites / 144 tests, 87.4 % statement coverage** (Jest + Supertest
+  against real PostgreSQL and Redis), plus a k6 load suite, a production smoke
+  script and a GitHub Actions pipeline whose `deploy` job `needs: ci` and runs
+  release migrations before both deploys.
+- **Measurement-driven indexing.** Six query-serving indexes, three added after
+  `EXPLAIN (ANALYZE, BUFFERS)` plans: the webhook shortfall release went from a
+  45,050-row sequential scan (**7.48 ms**) to a 2-row index scan (**0.16 ms**).
+
 ## Deploy
 
 Production shape and the exact checklist used for the public demo:
@@ -367,10 +391,20 @@ Reviewer notes:
 
 ## Demo
 
-**Live demo:** _pending — the Sprint 6 deploy fills in the Vercel URL here._
+- **Live demo:** https://seatsync-teal.vercel.app
+- **API:** https://seatsync-yaa6.onrender.com ([health](https://seatsync-yaa6.onrender.com/health), [Swagger UI](https://seatsync-yaa6.onrender.com/docs))
 
-These accounts are created by `pnpm --filter api seed:demo` and are public by
-design; never reuse their passwords anywhere else.
+![Live seat map](docs/live-seatmap.gif)
+
+_Two browser sessions against the production deployment: one attendee holds a
+seat the other has selected — the map recolors live and the "Seat just taken"
+toast appears. Recorded against https://seatsync-teal.vercel.app._
+
+These accounts and the **SeatSync Live Demo** event are created by
+`pnpm --filter api seed:demo`, which runs idempotently in `deploy.yml` after
+every deploy: the same two logins keep working and the demo event is reused
+rather than duplicated. The passwords are public by design; never reuse them
+anywhere else.
 
 | Role | Email | Password |
 | --- | --- | --- |
@@ -629,7 +663,7 @@ The p95 ceilings are ~2.3–2.6× the measured baselines and are pinned to this 
 
 `.github/workflows/ci.yml` runs on pull requests and on pushes to every branch except `main`. A single Ubuntu job uses Node.js 22 and pnpm 10.8.1, with `postgres:16` and `redis:7` service containers, then runs `pnpm install --frozen-lockfile`, `pnpm lint`, `pnpm typecheck`, `pnpm --filter api migrate up`, `pnpm --filter api migrate down`, `pnpm --filter api migrate up` and `pnpm test`. It then runs `pnpm --filter api test --coverage` and uploads `apps/api/coverage/` as the `api-coverage` artifact (14-day retention); coverage is report-only.
 
-`.github/workflows/deploy.yml` runs on pushes to `main` only. Its `ci` job is the same gate (same services, env, step order, coverage artifact), and the `deploy` job declares `needs: ci`: any failure skips release migrations, the Render deploy hook, the Vercel deploy, the demo seed and the live smoke test. `ci.yml` ignores `main` so the suite does not run twice for one commit. CI uses the standard Postgres port 5432 because the hosted runner is clean; local development uses 5434 (see below).
+`.github/workflows/deploy.yml` runs on pushes to `main` only. Its `ci` job is the same gate (same services, env, step order, coverage artifact), and the `deploy` job declares `needs: ci`: any failure skips release migrations, the Render deploy hook, the Vercel deploy, the demo seed and the live smoke test. The deploy job applies release migrations with the Neon direct URL, triggers the Render deploy hook, builds and deploys `apps/web` to Vercel production with `API_PROXY_TARGET` and `NEXT_PUBLIC_WS_URL`, waits for `/health`, re-runs the idempotent `seed:demo`, and finishes with `scripts/smoke.sh` against the deployed API. `ci.yml` ignores `main` so the suite does not run twice for one commit. CI uses the standard Postgres port 5432 because the hosted runner is clean; local development uses 5434 (see below). Both workflows and their run history are at https://github.com/Bucke200/seatsync/actions.
 
 ## Windows notes
 

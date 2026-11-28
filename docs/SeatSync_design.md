@@ -381,20 +381,20 @@ A sprint can start only when every sprint it depends on is merged to `main`. Spr
 
 **Tasks**
 
-- [ ] **Human:** create accounts and projects on the hosting platforms below, and add their secrets to the GitHub repository settings
-- [ ] Deploy the API to a host that keeps WebSocket connections open (Render, Railway, Fly.io or Cloud Run). Deploy `apps/web` to Vercel. Never put the API on serverless functions; they can't hold sockets.
-- [ ] Managed Postgres (Neon or Supabase) and managed Redis (Upstash), configured only through the Config variables
-- [ ] `.github/workflows/deploy.yml`: runs on push to `main`, `needs: ci`, runs migrations as a release step, then deploys the API and web app
-- [ ] Seed script `pnpm --filter api seed:demo`: one published demo event, plus one demo organizer and one demo attendee account
-- [ ] `scripts/smoke.sh <base-url>`: checks `/health`, logs in as the demo attendee, places a hold, requests a checkout URL, then releases the hold
-- [ ] README sections: overview, architecture diagram, "How double-booking is prevented" (Rules 1–7), running locally, running the tests and load tests, results (copied from the Metrics log), live demo link and demo logins
-- [ ] **Human:** record a GIF of the live seat map for the README, and update the resume bullets with the measured numbers. Word the hold bullet to match the architecture: Postgres conditional-UPDATE holds with a TTL sweeper; Redis only for pub/sub fan-out, caching and rate limiting — never "Redis seat holds"
+- [x] **Human:** create accounts and projects on the hosting platforms below, and add their secrets to the GitHub repository settings — done by the user on 2026-11-28 (Render, Neon, Upstash and Vercel projects; eleven GitHub secrets)
+- [x] Deploy the API to a host that keeps WebSocket connections open (Render, Railway, Fly.io or Cloud Run). Deploy `apps/web` to Vercel. Never put the API on serverless functions; they can't hold sockets. — Render Docker web service `https://seatsync-yaa6.onrender.com` (WebSocket at `/ws`) and Vercel `https://seatsync-teal.vercel.app`
+- [x] Managed Postgres (Neon or Supabase) and managed Redis (Upstash), configured only through the Config variables — Neon (pooled runtime URL; direct URL for release migrations) and Upstash `rediss://`, all via environment variables
+- [x] `.github/workflows/deploy.yml`: runs on push to `main`, `needs: ci`, runs migrations as a release step, then deploys the API and web app — embedded `ci` gate, Neon release migrations, Render deploy hook and Vercel production deploy
+- [x] Seed script `pnpm --filter api seed:demo`: one published demo event, plus one demo organizer and one demo attendee account — idempotent; runs after every deploy in `deploy.yml`
+- [x] `scripts/smoke.sh <base-url>`: checks `/health`, logs in as the demo attendee, places a hold, requests a checkout URL, then releases the hold — 8/8 checks pass against the deployed API
+- [x] README sections: overview, architecture diagram, "How double-booking is prevented" (Rules 1–7), running locally, running the tests and load tests, results (copied from the Metrics log), live demo link and demo logins — plus Resume highlights and the recorded seat-map GIF
+- [ ] **Human:** record a GIF of the live seat map for the README, and update the resume bullets with the measured numbers. Word the hold bullet to match the architecture: Postgres conditional-UPDATE holds with a TTL sweeper; Redis only for pub/sub fan-out, caching and rate limiting — never "Redis seat holds" — GIF recorded against the production deployment and embedded (`docs/live-seatmap.gif`) ✓; resume bullets drafted in the README (`Resume highlights`) — pending the user's final review
 
 **Acceptance checks**
 
-- `scripts/smoke.sh https://<api-host>` exits 0 against the deployed API
-- A PR with a failing test cannot deploy: the deploy job is skipped because it `needs: ci`
-- Opening the live web URL, logging in with the demo attendee account and holding a seat works end to end
+- [x] `scripts/smoke.sh https://<api-host>` exits 0 against the deployed API — 8/8 against https://seatsync-yaa6.onrender.com (recorded in the Sprint 6 completion report; re-run by `deploy.yml` after every deploy)
+- [x] A PR with a failing test cannot deploy: the deploy job is skipped because it `needs: ci` — structural proof in `deploy.yml` (`deploy` needs the embedded `ci` job); the merge-triggered run exercises the same gate
+- [x] Opening the live web URL, logging in with the demo attendee account and holding a seat works end to end — verified live on https://seatsync-teal.vercel.app (login, hold, countdown, release; two-tab live updates and the "Seat just taken" toast)
 
 **Out of scope:** custom domains, multi-region deployment, monitoring dashboards.
 
