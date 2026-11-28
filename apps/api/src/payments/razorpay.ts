@@ -14,6 +14,10 @@ import { verifyHmacSha256Hex } from "./signature";
  * - Checkout: `POST https://api.razorpay.com/v1/payment_links` with the amount
  *   in paise, `currency: "INR"` and `notes: { bookingId, holdId }`; the
  *   returned `short_url` is the checkout URL.
+ * - Callback: when `callbackUrl` is supplied, the request also carries
+ *   `callback_url` and `callback_method: "get"`, so Razorpay redirects the
+ *   customer back to the web booking page after payment. Without it the pair
+ *   is omitted and Razorpay's own confirmation page stays in effect.
  * - Webhook: `X-Razorpay-Signature` is the hex HMAC-SHA256 of the raw body
  *   keyed by `PAYMENT_WEBHOOK_SECRET`, checked with `timingSafeEqual`.
  * - Refund: `POST /v1/payments/:id/refund` with the amount in paise.
@@ -206,6 +210,16 @@ export class RazorpayPaymentProvider implements PaymentProvider {
           bookingId: input.bookingId,
           holdId: input.holdId,
         },
+        // Payment Links redirect the customer to `callback_url` after
+        // payment; `callback_method: "get"` makes that a GET navigation.
+        // The pair is sent only when a callback is configured, so a
+        // deployment without WEB_URL keeps Razorpay's confirmation page.
+        ...(input.callbackUrl === undefined
+          ? {}
+          : {
+              callback_url: input.callbackUrl,
+              callback_method: "get",
+            }),
       }),
     });
 

@@ -131,7 +131,9 @@ export class FakePaymentProvider implements PaymentProvider {
   ): Promise<{ checkoutUrl: string }> {
     assertPositiveIntegerPaise(input.amountPaise);
 
-    // Deterministic and same-origin so the web app can redirect to it.
+    // Deterministic and same-origin so the web app can redirect to it. The
+    // optional `callbackUrl` is deliberately ignored: this URL already lands
+    // on the same bookings page that Razorpay's callback_url targets (parity).
     return { checkoutUrl: `/bookings/${input.bookingId}?fakeCheckout=1` };
   }
 
