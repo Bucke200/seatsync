@@ -1,0 +1,126 @@
+# Sprint notes
+
+Per-sprint engineering notes from the build, moved from the README. The
+[README](../README.md) keeps the live demo, the architecture and the
+double-booking rules, the deployment guide and the local/load-test runbooks;
+this file is the historical per-sprint record.
+
+## Sprint 0 — Foundation
+
+Sprint 0 laid the full CI/CD foundation: a strict-TypeScript workspace, a
+fail-fast typed config loader, a `users` migration, a health endpoint with
+request-ID logging, integration tests against a real Postgres, and a GitHub
+Actions workflow that installs, lints, typechecks, migrates and tests every push
+and pull request.
+
+Its acceptance checks — health with both dependencies up, a 503 naming Redis
+when it is stopped, migrations up/down/up, and the lint + typecheck + test gate
+— are kept as runnable commands in the README under
+[Running locally → Acceptance checks](../README.md#acceptance-checks).
+
+## Sprint 1 — Auth, roles and events
+
+Sprint 1 adds accounts and event management on top of the Sprint 0 foundation:
+
+- **Auth:** `POST /auth/signup`, `/auth/login`, `/auth/refresh` and `/auth/logout`. Passwords are hashed with argon2; access tokens are JWTs valid for `ACCESS_TOKEN_TTL_SECONDS`; the refresh token is an httpOnly, Secure, SameSite=Strict `refresh_token` cookie, stored in `refresh_tokens` only as a SHA-256 hash so logout can revoke it.
+- **Authorisation:** `requireAuth` and `requireRole` middleware, plus organizer ownership checks on every event write. An attendee on an organizer route gets `403`, and organizer A cannot edit organizer B's event.
+- **Events:** `POST /events` inserts the event and all of its seats in one Postgres transaction; `PATCH /events/:id`, `POST /events/:id/publish` and `POST /events/:id/unpublish` are organizer-only; `GET /events` is cursor-paginated on `(starts_at, id)` and returns published events only; `GET /events/:id` returns the event plus every seat with its status.
+- **API docs:** an OpenAPI 3 document generated from the shared zod schemas is served as JSON at `/docs.json`, with Swagger UI at http://localhost:4000/docs.
+- **Web:** `/signup`, `/login`, `/events`, `/events/[id]` (static seat grid with AVAILABLE/HELD/BOOKED badges) and `/organizer/events/new`, calling the API through the Next.js `/api/*` proxy at http://localhost:3000.
+
+Try the full flow:
+
+```bash
+docker compose up -d
+```
+
+Open http://localhost:3000/signup, register as an **Organizer**, create an event with a seat layout, publish it, then browse http://localhost:3000/events. Registering as an **Attendee** and opening an event shows its seat grid. The same endpoints are available from `curl.exe` against `http://localhost:4000`.
+
+## Sprint 2 — Seat holds
+
+Sprint 2 adds seat holds on top of the Sprint 1 event flow:
+
+- **Lock-then-update:** `POST /events/:id/holds` runs Rule 1 in one Postgres transaction: it locks the requested seats in deterministic ID order (`ORDER BY id FOR UPDATE`), then conditionally updates only rows that are `AVAILABLE` or whose hold has expired. If fewer rows come back than requested, the transaction rolls back and returns `409 SEATS_UNAVAILABLE` with `details.seatIds`; any number of concurrent requests for the same seat therefore produce exactly one hold.
+- **Endpoints:** `POST /events/:id/holds` requires a Bearer token, a published event and an `Idempotency-Key` header; its body is `{ seatIds }` (1 to `MAX_SEATS_PER_HOLD`, default 6) and it returns `201 { holdId, seatIds, heldUntil }`, where the hold lasts `HOLD_TTL_SECONDS` (default 600). `DELETE /holds/:id` is holder-only and returns `204` after setting the seats back to `AVAILABLE`.
+- **Validation:** `seatIds` must be unique UUIDs; empty, duplicate or malformed arrays return `422 VALIDATION_ERROR`, more than the maximum returns `422 TOO_MANY_SEATS`, and unknown or foreign seats return `409 SEATS_UNAVAILABLE`. A second active hold by the same user for the same event returns `409 SEATS_UNAVAILABLE` with the seats already held, and a missing or draft event returns `404 EVENT_NOT_FOUND`.
+- **Idempotency:** the same key with the same body and user replays the stored `201` or `409` verbatim and creates one hold; the same key with a different body or from a different user returns `422`, and a missing or blank header returns `400`. Keys are claimed with `INSERT ... ON CONFLICT DO NOTHING` and then read under `FOR UPDATE`, never check-then-insert.
+- **Sweeper:** `expireHolds` runs every `SWEEPER_INTERVAL_SECONDS` (default 30), selects expired holds with `ORDER BY id FOR UPDATE SKIP LOCKED` so it never blocks or deadlocks against the hold or confirm paths, clears the hold columns with `version = version + 1`, and prunes `idempotency_keys` (and `processed_webhooks` once Sprint 3 creates it) older than `RETENTION_DAYS` (default 30).
+- **Expired-hold reads:** seat reads, including `GET /events/:id`, treat a `HELD` seat whose `held_until` has passed as `AVAILABLE` using the database clock, so an expired hold never looks taken before the sweeper clears it.
+- **Tests:** six acceptance suites cover the race (200 concurrent holds on one seat → one `201`, 199×`409`, exactly one `HELD` row), overlapping holds, expiry including one sweeper run, idempotency, the Rule 3 `23505` backstop for confirmed bookings and `seatEvents` emission (nothing on rollback, once after `COMMIT`, per-seat versions).
+- **Web:** `/events/[id]` lets a signed-in attendee select seats, hold them and count down to `heldUntil`; Release returns them immediately, and a `409` lists the seats that were taken.
+
+Try it: open http://localhost:3000/events as an attendee, choose a published event and select up to six seats — **Hold seats** starts the countdown and **Release** returns them immediately.
+
+## Sprint 3 — Payments and bookings
+
+Sprint 3 turns a paid hold into a booking exactly once and gives every failure a defined state:
+
+- **Checkout:** `POST /holds/:id/checkout` (holder only) creates a `PENDING` booking bound to the hold (unique `bookings.hold_id`) plus its `PENDING` `booking_seats`, sets `amount_paise` to the sum of the held seats' `price_paise`, passes `{ bookingId, holdId }` to the provider as checkout metadata, stores `checkout_url` and returns `{ bookingId, checkoutUrl }`. A second checkout for the same hold replays the stored response instead of hitting the unique constraint.
+- **Providers:** `PAYMENT_PROVIDER` selects the implementation. `fake` is the default and the provider every automated test uses: deterministic, offline, HMAC-signed webhooks, with inspectable refund calls and one-shot refund/post-dedupe failure seams. `razorpay` uses Payment Links and verifies `X-Razorpay-Signature` with a timing-safe HMAC; `stripe` is not implemented. Each provider normalizes its events to `{ eventId, type: payment_succeeded | checkout_expired, bookingId, paymentRef }`.
+- **Webhook dedupe (Rule 4):** `POST /webhooks/:provider` reads the exact raw body and verifies the signature before any database work, so a bad signature is `400` with zero writes. The transaction inserts the provider `event_id` into `processed_webhooks` with `ON CONFLICT DO NOTHING`; a replay commits and returns `200` without touching dedupe rows, bookings or seats again.
+- **Confirm or release (Rule 2):** `payment_succeeded` locks the booking `FOR UPDATE`, then pre-locks the hold's seats in ID order. When every seat is still `HELD` under that hold, they all become `BOOKED` (clearing `held_until`, bumping `version`) and the booking plus its `booking_seats` become `CONFIRMED`. On a shortfall, only seats still bound to that hold are released and the booking becomes `FAILED`, so a seat another user has since re-held and paid for is never touched. `checkout_expired` releases the hold's still-`HELD` seats and fails a still-`PENDING` booking. Per-seat `seatEvents` emit only after `COMMIT`.
+- **Refunds:** a `FAILED` booking with a `payment_ref` is refundable. The first attempt runs after `COMMIT`, never inside the webhook transaction; the `retryRefunds` job repeats it every `SWEEPER_INTERVAL_SECONDS`, claiming rows with `FOR UPDATE SKIP LOCKED`, until the booking and its `booking_seats` reach `REFUNDED`. A failing provider call leaves the booking `FAILED` for the next run and never changes the webhook's `200`.
+- **Reads:** `GET /bookings/:id` is owner-only (`404 BOOKING_NOT_FOUND` for a missing booking, `403 FORBIDDEN` for someone else's) and `GET /me/bookings` lists the caller's bookings newest first with the event and seat count.
+- **Tests:** seven acceptance suites under `apps/api/test/payments/` run against real Postgres with the fake provider: webhook replay (five deliveries, one confirmation), two events for one payment, late payment (A is refunded while B keeps the seat), bad signature, post-dedupe rollback followed by redelivery, refund retry, and partial loss with the Rule 3 invariant queries.
+- **Web:** the hold banner on `/events/[id]` gains a **Pay** button that starts checkout and redirects to the provider URL (the fake provider returns the same-origin `/bookings/{bookingId}?fakeCheckout=1`). `/bookings/[id]` polls `GET /bookings/:id` every two seconds until the status is `CONFIRMED`, `FAILED` or `REFUNDED`, and `/me/bookings` lists the caller's bookings.
+
+To use Razorpay, set `PAYMENT_PROVIDER=razorpay` together with `RAZORPAY_KEY_ID` and `RAZORPAY_KEY_SECRET` (the config fails fast if either is missing) and keep `PAYMENT_WEBHOOK_SECRET` set to the secret configured in the Razorpay dashboard. The automated suites always force `PAYMENT_PROVIDER=fake`, so CI needs no sandbox keys.
+
+**Blocked — Human:** in the Razorpay sandbox, pay with a test card and then resend the same webhook event from the Razorpay CLI or dashboard; the booking must not change. This live card + resend check is still pending real sandbox keys.
+
+## Sprint 4 — Real-time seat map
+
+Sprint 4 makes every open browser see seat changes within `LIVE_UPDATE_MAX_MS`, across multiple API instances:
+
+- **WebSocket server:** `WS /ws` shares the API's HTTP server. The client's first frame must be `{ "type": "auth", "token" }` (acknowledged with `{ "type": "auth_ok" }`); `{ "type": "subscribe", "eventId" }` then joins that event's room (acknowledged with `{ "type": "subscribed", "eventId" }`). A bad or expired token, a non-auth first frame or a pre-auth subscribe gets `{ "type": "error", "code": "UNAUTHORIZED" }` and close code `1008` — there is no anonymous mode. After authentication, unknown frames and duplicate auth get `BAD_MESSAGE` without closing, while a non-UUID subscribe is fatal; a 30-second ping/pong heartbeat terminates any socket that misses one pong.
+- **Fan-out:** `realtime/publisher.ts` listens to the post-commit `seatEvents` emitter, groups same-tick per-seat changes per event and publishes `{ eventId, seats: [{ id, status, version }] }` to `seats:{eventId}`. Every instance's `realtime/subscriber.ts` `PSUBSCRIBE`s `seats:*` and forwards each message to the sockets in that room. Grouping is transport only: each seat keeps the exact version its own `UPDATE ... RETURNING` produced (Rule 7).
+- **Redis stays optional:** publisher and subscriber use dedicated connections (never the shared `/health` client) with no offline command queue and a 250 ms → 5 s capped reconnect backoff. Publish/subscribe failures are logged and dropped, so a Redis outage can never block or fail a hold, booking or webhook; when Redis returns, the subscription resumes and live updates continue. `redis-down.test.ts` proves holds still return `201` and the Sprint 2 race suite still passes while the realtime pub/sub connections cannot reach Redis.
+- **Client stale filter:** `GET /events/:id` now returns each seat's `version`; the web app keeps a `Map<seatId, version>` and applies a WebSocket update only when its version is strictly greater (shared `applySeatVersionFilter` / `mergeSeatSnapshot` helpers in `packages/shared`). Duplicate or out-of-order frames are ignored.
+- **Live UX:** seat colours change immediately. If another user takes a seat in the current selection, it is deselected and a "Seat just taken" toast appears; a seat whose hold request is already in flight is exempt because that frame is the viewer's own hold.
+- **Reconnect:** a closed socket retries after 1 s, 2 s, 4 s, 8 s and then every 15 s. Each attempt refreshes the access token through the httpOnly cookie, re-authenticates and re-subscribes, then refetches `GET /events/:id` and rebuilds the version map, so a change missed while disconnected cannot survive as a newer version. A 4xx refresh (the session is gone) stops the loop; a 5xx or transport blip keeps the stored token and retries.
+- **WS URL:** the browser connects directly to `NEXT_PUBLIC_WS_URL ?? "ws://localhost:4000/ws"`. The Next.js `/api/*` rewrite is HTTP-only and cannot proxy an `Upgrade`, so the socket must not go through it. `NEXT_PUBLIC_WS_URL` is inlined at build time; set it (for example `NEXT_PUBLIC_WS_URL=ws://localhost:4010/ws pnpm --filter web build`) when pointing the web app at another API host or at the scale stack.
+- **Tests:** seven suites under `apps/api/test/realtime/`: the five design.md acceptance checks (`live`, `multi-instance`, `redis-down`, `stale`, `reconnect`) plus `ws.protocol` (auth, `1008` and room rules) and `publisher` (same-tick grouping, later-write-wins, corrupt-message resilience).
+- **Scale:** `docker-compose.scale.yml` runs two `api` replicas behind nginx on `http://localhost:4010`, sharing one Postgres and Redis; a client on one replica receives a change committed through the other. Boot it with the command in the README's [multi-instance scale stack](../README.md#multi-instance-scale-stack-sprint-4).
+
+Try it: open http://localhost:3000/events in two browser tabs as two attendees — a seat held in one tab turns HELD in the other within `LIVE_UPDATE_MAX_MS`.
+
+## Sprint 5 — Load testing and hardening
+
+Sprint 5 measures the hold, confirm and event-detail paths under load, then fixes what the load runs expose:
+
+- **Per-user rate limit:** `POST /events/:id/holds` counts every authenticated attempt per user (`user.id`, never IP or a global counter) in a fixed 60-second window and returns `429 RATE_LIMITED` once `HOLDS_RATE_LIMIT_PER_MINUTE` (default 20) is exceeded. The check runs after `requireAuth` and before the idempotency read, request validation or `pool.connect()`, so a 429 writes no `idempotency_keys` row and changes no seat. Redis is fail-open: a connection error, a not-ready client or an EVAL that misses its 1.5-second deadline logs a throttled warning and allows the hold, so a Redis outage can never turn into a 429 or a failed hold. Replays are free only within budget: over the limit, even an exact replay of a stored 201/409 gets 429 until the next window.
+- **Security middleware:** helmet sets CSP, nosniff, frame denial, a referrer policy and HSTS on every response (`upgrade-insecure-requests` is dropped because Swagger UI loads its bundle over http locally); CORS uses the `CORS_ORIGINS` allowlist (default `http://localhost:3000`, never `*`) with credentials for the refresh cookie; JSON and raw request bodies are capped at 100 kB and an overrun is `413 PAYLOAD_TOO_LARGE` in the standard error shape, not a 500.
+- **Indexes (migration 0006):** three indexes were added only after `EXPLAIN (ANALYZE, BUFFERS)` on a 45,050-seat / 10,000-booking fixture: partial `idx_seats_hold_id` on `seats(hold_id) WHERE hold_id IS NOT NULL` (webhook confirm/shortfall and release seat lookups — the shortfall release was a 45,050-row sequential scan, 879 buffers and 7.5 ms, now a 2-row bitmap scan in 2 buffers and ~0.16 ms), partial `idx_seats_event_held_by` on `seats(event_id, held_by) WHERE held_by IS NOT NULL` (the second-hold guard fell from 125 buffers to 9) and `idx_bookings_user_created` on `bookings(user_id, created_at DESC, id DESC)` (`GET /me/bookings` fell from 199 buffers to 64). The migration round-trips up/down.
+- **Load suite:** `pnpm --filter api seed:load` creates one published 50-seat event and 200 attendee accounts, signs their access tokens directly (no argon2) and writes `load/users.json`. Three k6 scripts run from a `grafana/k6` container: `load/flash-sale.js` (200 VUs, one hold each, a unique `Idempotency-Key` per request, all racing the same 50 seats), `load/mixed.js` (20 VUs for 90 s browsing `GET /events` and `GET /events/:id` with paced holds/releases) and `load/webhook-storm.js` (20 VUs / 200 signed fake-provider deliveries: duplicates, out-of-order races and replays for five bookings). Each script fails on a non-expected status rate of 1 % or more and on a pinned p95; `mixed` also fails on any single 429, while `webhook-storm` asserts every booking's terminal state in teardown. `load/invariants.sql` is the three zero-row Rule 3 checks.
+- **CI:** a `Coverage` step runs `pnpm --filter api test --coverage` and uploads `apps/api/coverage/` as a 14-day artifact. Coverage is report-only — 87.44 % statements / 87.43 % lines / 64.22 % branches / 88.64 % functions — and no threshold is enforced yet (a ratchet is a later choice).
+
+Run the load tests on Windows PowerShell 5.1 (one line at a time). The dev `.env` uses `PAYMENT_PROVIDER=razorpay`, which rejects fake-provider webhooks, so the normal `api` container is stopped and a temporary one is started on the same port from the compose-built image. The exact command sequence is in the README's [load-test runbook](../README.md#load-test-runbook-sprint-5).
+
+`load/users.json` is gitignored. The seeded JWTs expire after `ACCESS_TOKEN_TTL_SECONDS` (15 minutes), so run `seed:load` immediately before **each** scenario — `webhook-storm` also consumes seats 0–4 in its setup, and the hold scenarios leave seats held — and re-seed again before the next one.
+
+Measured on the Sprint 5 load host (AMD Ryzen 5 5600H, 6 cores / 12 threads, 16 GiB RAM; Windows 11; API, Postgres and Redis in Docker Desktop; k6 v2.4.0 in a container on the same host):
+
+| Scenario | Load | Result |
+| --- | --- | --- |
+| Flash sale | 200 VUs × 1 hold, same 50 seats | 7×201 + 193×409 (re-run 6×201 + 194×409), **zero 5xx or other statuses**; p95 **883.73 ms** baseline / **404.68 ms** re-run (threshold 2000 ms); 182.52 req/s (316.38 re-run) |
+| Mixed | 20 VUs, 90 s, 1200 iterations | 30.05 req/s; p95 **22.17 ms** (threshold 50 ms); **zero 429s** |
+| Webhook storm | 20 VUs / 200 deliveries | 480.54–497.41 deliveries/s (516.58–534.72 total req/s); p95 **77.03 ms** (threshold 200 ms); every booking reached its terminal state |
+| Invariants | after every run (6 runs) | **0 rows** from all three queries — zero oversells |
+
+The p95 ceilings are ~2.3–2.6× the measured baselines and are pinned to this development host: they catch a real regression on the same machine, but they are not a universal latency SLO.
+
+## Sprint 6 — Deploy and ship
+
+Sprint 6 put SeatSync on managed infrastructure and made every push to `main`
+ship it automatically: the API runs as a Render Docker web service (WebSocket at
+`/ws`), the web app on Vercel, PostgreSQL on Neon (pooled runtime URL, direct URL
+for release migrations), Redis on Upstash and Razorpay test mode for payments.
+`deploy.yml` embeds the `ci` gate as a job and its `deploy` job declares
+`needs: ci`, so a failing test skips release migrations, the Render deploy hook,
+the Vercel deploy, the demo seed and the live smoke test. The idempotent
+`seed:demo` script creates the demo organizer, demo attendee and the
+**SeatSync Live Demo** event, and `scripts/smoke.sh` finishes every deploy with
+8/8 checks against the deployed API. The platform table, environment variables,
+GitHub secrets, bootstrap sequence and smoke runbook are in the README's
+[Deployment](../README.md#deployment) section; the public demo is at
+https://seatsync-teal.vercel.app.
