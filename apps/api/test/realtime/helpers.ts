@@ -14,6 +14,7 @@ import request from "supertest";
 import { WebSocket, type RawData } from "ws";
 import { createApp } from "../../src/app";
 import type { Config } from "../../src/config";
+import type { HoldsRateLimiter } from "../../src/middleware/rateLimit";
 import {
   startSeatEventPublisher,
   type SeatEventPublisherHandle,
@@ -670,7 +671,19 @@ export async function bootTestApp(
   }
 
   async function close(): Promise<void> {
+    // D33: `createApp` owns a dedicated limiter connection unless the caller
+    // injected one. Close it after pub/sub and before the WS attachment / HTTP
+    // drain, mirroring `server.ts` (stop traffic sources, then auxiliary Redis
+    // clients, then pool/health teardown in the caller). `close()` is
+    // idempotent, so a caller that already closed an injected limiter is safe.
+    const limiter = app.locals["holdsRateLimiter"] as HoldsRateLimiter | undefined;
+
     await stopPubSub();
+
+    if (limiter !== undefined) {
+      await limiter.close();
+    }
+
     await realtime.close();
     await new Promise<void>((resolve) => {
       server.close(() => resolve());

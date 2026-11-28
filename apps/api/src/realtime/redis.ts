@@ -63,6 +63,40 @@ export function createPubSubSubscriber(config: Config, log: Logger = logger): Re
 }
 
 /**
+ * Create the dedicated Redis client for the per-user hold rate limiter (D33).
+ *
+ * It copies the fail-soft template used by the shared and pub/sub clients
+ * (lazy connect, no offline command queue, one retry per command, logging-only
+ * `error` listener) and is deliberately separate from both: a limiter outage
+ * must never degrade `/health` or the realtime fan-out. The socket is
+ * `unref()`ed on every connect because this connection is auxiliary: the HTTP
+ * server keeps the production process alive, while a test worker can exit
+ * without an explicit close.
+ */
+export function createRateLimitRedisClient(
+  config: Pick<Config, "REDIS_URL">,
+  log: Logger = logger,
+): Redis {
+  const client = new Redis(config.REDIS_URL, {
+    lazyConnect: true,
+    enableOfflineQueue: false,
+    maxRetriesPerRequest: 1,
+  });
+
+  client.on("error", (error) => {
+    log.warn({ err: error }, "Redis rate limiter error; hold requests fail open");
+  });
+
+  // `connect` fires again after every successful reconnect, so the replacement
+  // socket is unref'ed too.
+  client.on("connect", () => {
+    client.stream.unref();
+  });
+
+  return client;
+}
+
+/**
  * Create the shared Redis client.
  *
  * Redis is never required for correctness, so the client must never block or

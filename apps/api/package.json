@@ -7,6 +7,7 @@
     "dev": "node -r dotenv/config --env-file-if-exists=../../.env --import tsx src/server.ts",
     "start": "node --env-file-if-exists=../../.env --import tsx src/server.ts",
     "migrate": "node --env-file-if-exists=../../.env node_modules/node-pg-migrate/bin/node-pg-migrate.js -m migrations -d DATABASE_URL",
+    "seed:load": "tsx src/scripts/seedLoad.ts",
     "lint": "eslint .",
     "typecheck": "tsc --noEmit",
     "test": "node --env-file-if-exists=../../.env node_modules/jest/bin/jest.js"
@@ -16,8 +17,10 @@
     "@seatsync/shared": "workspace:*",
     "argon2": "^0.45.2",
     "cookie-parser": "^1.4.7",
+    "cors": "^2.8.6",
     "dotenv": "^16.4.7",
     "express": "^4.21.2",
+    "helmet": "^8.3.0",
     "ioredis": "^5.4.2",
     "jsonwebtoken": "^9.0.3",
     "pg": "^8.13.1",
@@ -29,6 +32,7 @@
   "devDependencies": {
     "@jest/globals": "^29.7.0",
     "@types/cookie-parser": "^1.4.10",
+    "@types/cors": "^2.8.19",
     "@types/express": "^4.17.21",
     "@types/express-serve-static-core": "^4.19.9",
     "@types/jsonwebtoken": "^9.0.10",

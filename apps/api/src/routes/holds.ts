@@ -6,6 +6,10 @@ import { z } from "zod";
 import type { Config } from "../config";
 import { requireAuth } from "../middleware/auth";
 import { ApiError, asyncHandler } from "../middleware/errors";
+import {
+  createHoldsRateLimiter,
+  type HoldsRateLimiter,
+} from "../middleware/rateLimit";
 import { createHold, releaseHold } from "../services/holds";
 
 const EventIdSchema = z.string().uuid();
@@ -61,19 +65,34 @@ function parseHoldRequest(req: Request): HoldRequest {
   return parsed.data;
 }
 
+export interface HoldsRouter {
+  router: Router;
+  /** Exposed so the app/server can own the limiter's connection lifecycle. */
+  rateLimiter: HoldsRateLimiter;
+}
+
 /**
  * Hold routes. Both require a Bearer token; the holder-only check for release
  * lives in the db layer (403) and an unknown or expired hold is 404.
  *
  * The router is mounted at the app root because its two paths live under
  * different prefixes (`/events/...` and `/holds/...`).
+ *
+ * D33: the per-user limiter is created here (once per app) and applied only to
+ * `POST /events/:id/holds`, after authentication and before any idempotency or
+ * database work. `DELETE /holds/:id` is deliberately unlimited.
  */
-export function createHoldsRouter(pool: Pool, config: Config): Router {
+export function createHoldsRouter(
+  pool: Pool,
+  config: Config,
+  rateLimiter: HoldsRateLimiter = createHoldsRateLimiter({ config }),
+): HoldsRouter {
   const router = Router();
 
   router.post(
     "/events/:id/holds",
     requireAuth(config),
+    rateLimiter,
     asyncHandler(async (req, res) => {
       const eventId = readEventId(req);
       const idempotencyKey = readIdempotencyKey(req);
@@ -102,5 +121,5 @@ export function createHoldsRouter(pool: Pool, config: Config): Router {
     }),
   );
 
-  return router;
+  return { router, rateLimiter };
 }

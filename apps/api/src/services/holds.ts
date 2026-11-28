@@ -8,8 +8,15 @@ import {
 } from "../db/seats";
 import { ApiError } from "../middleware/errors";
 
-/** The config slice the hold service actually reads. */
-export type HoldsConfig = Pick<Config, "HOLD_TTL_SECONDS" | "MAX_SEATS_PER_HOLD">;
+/**
+ * The config slice the hold path reads. `HOLDS_RATE_LIMIT_PER_MINUTE` is used
+ * by the route's limiter (D33), not by `createHold`, but it belongs to the hold
+ * contract and is wired from the environment (Rule 65), never hard-coded.
+ */
+export type HoldsConfig = Pick<
+  Config,
+  "HOLD_TTL_SECONDS" | "MAX_SEATS_PER_HOLD" | "HOLDS_RATE_LIMIT_PER_MINUTE"
+>;
 
 export interface CreateHoldInput {
   userId: string;

@@ -313,7 +313,11 @@ export function generateOpenApiDocument() {
     description:
       "Rule 1 lock-then-update: the request either holds every requested seat " +
       "or none. Requires the Idempotency-Key header; a replay of the same key, " +
-      "user and body returns the stored response verbatim.",
+      "user and body returns the stored response verbatim while the user stays " +
+      "within HOLDS_RATE_LIMIT_PER_MINUTE. Every authenticated attempt, replays " +
+      "included, counts toward that per-user limit; the next attempt after the " +
+      "limit is a 429 RATE_LIMITED and writes nothing to Postgres. Idempotent " +
+      "replay is therefore conditional on the fixed 60 s rate window.",
     security: [{ bearerAuth: [] }],
     request: {
       params: EventIdParamsSchema,
@@ -330,6 +334,11 @@ export function generateOpenApiDocument() {
       404: errorResponse("Event not found or draft hidden"),
       409: errorResponse("One or more seats are unavailable, or the user already holds seats"),
       422: errorResponse("Invalid seat ids, too many seats, or idempotency key conflict"),
+      429: errorResponse(
+        "The user's per-minute hold rate limit was exceeded. Replays of a " +
+          "stored 201/409 also count toward the limit and return 429 (not the " +
+          "stored response) while the window is exhausted.",
+      ),
     },
   });
 

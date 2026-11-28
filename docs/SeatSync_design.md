@@ -352,24 +352,24 @@ A sprint can start only when every sprint it depends on is merged to `main`. Spr
 
 **Tasks**
 
-- [ ] Seed script `pnpm --filter api seed:load`: one published event with 50 seats and a pool of attendee accounts whose tokens are written to `load/users.json`
-- [ ] `load/flash-sale.js`: every virtual user tries to hold the same 50 seats, each request with a unique `Idempotency-Key`
-- [ ] `load/mixed.js`: steady browsing (`GET /events`, `GET /events/:id`) mixed with holds and releases
-- [ ] `load/webhook-storm.js`: bursts of duplicate and out-of-order fake-provider webhooks for the same bookings
-- [ ] `load/invariants.sql`: queries that return 0 rows when the data is correct: no seat with more than one `CONFIRMED` booking\_seats row (two PENDING rows are legal — see Rule 3), every `BOOKED` seat matching a `CONFIRMED` booking, and every seat of a `CONFIRMED` booking is `BOOKED`
-- [ ] k6 thresholds in each script: non-409 error rate below 1%, plus a p95 threshold recorded after the first baseline run
-- [ ] EXPLAIN ANALYZE every query on the hold, confirm and event-detail paths; add any missing indexes in a migration
-- [ ] Pool size from `DB_POOL_SIZE`; Redis-backed rate limit on `POST /events/:id/holds` using `HOLDS_RATE_LIMIT_PER_MINUTE` (429 when exceeded)
-- [ ] helmet, a CORS allowlist from `CORS_ORIGINS`, and a JSON body size limit
-- [ ] Optional: cache `GET /events` and `GET /events/:id` in Redis, invalidated on every `seatEvents` change for that event
-- [ ] Jest coverage report uploaded as a CI artifact
+- [x] Seed script `pnpm --filter api seed:load`: one published event with 50 seats and a pool of attendee accounts whose tokens are written to `load/users.json`
+- [x] `load/flash-sale.js`: every virtual user tries to hold the same 50 seats, each request with a unique `Idempotency-Key`
+- [x] `load/mixed.js`: steady browsing (`GET /events`, `GET /events/:id`) mixed with holds and releases
+- [x] `load/webhook-storm.js`: bursts of duplicate and out-of-order fake-provider webhooks for the same bookings
+- [x] `load/invariants.sql`: queries that return 0 rows when the data is correct: no seat with more than one `CONFIRMED` booking\_seats row (two PENDING rows are legal — see Rule 3), every `BOOKED` seat matching a `CONFIRMED` booking, and every seat of a `CONFIRMED` booking is `BOOKED`
+- [x] k6 thresholds in each script: non-409 error rate below 1%, plus a p95 threshold recorded after the first baseline run
+- [x] EXPLAIN ANALYZE every query on the hold, confirm and event-detail paths; add any missing indexes in a migration
+- [x] Pool size from `DB_POOL_SIZE`; Redis-backed rate limit on `POST /events/:id/holds` using `HOLDS_RATE_LIMIT_PER_MINUTE` (429 when exceeded)
+- [x] helmet, a CORS allowlist from `CORS_ORIGINS`, and a JSON body size limit
+- [ ] Optional: cache `GET /events` and `GET /events/:id` in Redis, invalidated on every `seatEvents` change for that event (skipped — see Sprint 5 completion report; D37)
+- [x] Jest coverage report uploaded as a CI artifact
 
 **Acceptance checks**
 
-- `k6 run load/flash-sale.js` passes its thresholds, then `psql "$DATABASE_URL" -f load/invariants.sql` returns 0 rows
-- `k6 run load/webhook-storm.js` passes, and the invariants still return 0 rows
-- Every bug found under load has a regression test in `apps/api/test`
-- The Metrics log has every row filled in, with the k6 options used (virtual users, iterations) and the machine spec
+- [x] `k6 run load/flash-sale.js` passes its thresholds, then `psql "$DATABASE_URL" -f load/invariants.sql` returns 0 rows
+- [x] `k6 run load/webhook-storm.js` passes, and the invariants still return 0 rows
+- [x] Every bug found under load has a regression test in `apps/api/test` (no API-behaviour bug surfaced; the only bug was a k6 threshold-syntax tooling bug fixed in the load scripts — see the completion report)
+- [x] The Metrics log has every row filled in, with the k6 options used (virtual users, iterations) and the machine spec
 
 **Out of scope:** horizontal autoscaling, distributed tracing.
 
@@ -411,12 +411,14 @@ A sprint can start only when every sprint it depends on is merged to `main`. Spr
 
 | Metric | Value | How it was measured | Sprint |
 | --- | --- | --- | --- |
-| Oversells in the flash-sale test |  | k6 scenario A + invariant query | 5 |
-| Concurrent requests on the same seats |  | k6 virtual users | 5 |
-| p95 latency for POST /events/:id/holds |  | k6 summary | 5 |
-| Throughput |  | k6 summary, req/s | 5 |
+| Oversells in the flash-sale test | 0 (no seat with more than one `CONFIRMED` `booking_seats` row; `load/invariants.sql` returned 0 rows after every scenario run, six runs in total) | k6 flash-sale: 200 VUs × 1 iteration, every user racing over the same 50 seats; invariant query against the load database after each run | 5 |
+| Concurrent requests on the same seats | 200 VUs, one hold request each (200 distinct users and `Idempotency-Key`s; 6-seat chunks of the same 50 seats; 7×201 + 193×409 baseline, 6×201 + 194×409 re-run, zero other statuses) | k6 `per-vu-iterations` scenario, `vus: 200, iterations: 1` | 5 |
+| p95 latency for POST /events/:id/holds | 883.73 ms baseline; 404.68 ms on the pinned-threshold re-run; threshold pinned at `p(95)<2000` ms (~2.3× baseline) | k6 flash-sale summary, 200 VUs × 1 iteration per run | 5 |
+| Throughput | 182.52 req/s flash-sale (200 requests in ~1.1 s; 316.38 req/s on the re-run), 30.05 req/s mixed over 90 s, 480.54–497.41 webhook deliveries/s storm (516.58–534.72 total req/s including setup/teardown) | k6 summaries, `http_reqs` rate; a single API container | 5 |
 | Live update latency | ~37–80 ms (in-suite 78–80 ms; browser cross-replica ≤37 ms, tab B flip before originating tab's own recolor) | Both measured post-merge: (1) in-process cross-instance `multi-instance.test.ts` — REST hold via API instance 2 → WS frame on instance 1 through Redis pub/sub, arrival − send over 2 runs (80, 78 ms); (2) real browser tabs across 2 containerized api replicas through nginx — tab B on api-2 recolored 37 ms before tab A (api-1)'s own flip, i.e. cross-replica fan-out ≤37 ms observed; earlier same-replica browser samples were −69/−51 ms | 4 |
-| Test coverage of the API |  | Jest coverage report | 5 |
+| Test coverage of the API | 87.44% statements / 87.43% lines / 64.22% branches / 88.64% functions | `jest --coverage` in CI (`pnpm --filter api test -- --coverage`, artifact uploaded) | 5 |
+
+Sprint 5 load host: AMD Ryzen 5 5600H (6 cores / 12 threads), 15.4 GiB visible RAM (16 GiB physical), Windows 11 Pro for Workstations; API, Postgres and Redis in Docker Desktop containers, k6 in a `grafana/k6` container on the same host. The mixed scenario used 20 VUs for 90 s (`constant-vus`, 1200 iterations); the webhook storm used 20 VUs / 200 shared iterations. The API container ran with `PAYMENT_PROVIDER=fake` and `DB_POOL_SIZE=20`.
 
 **Questions to be ready for, and the sprint that answers each**
 

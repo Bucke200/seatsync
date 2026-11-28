@@ -1,0 +1,169 @@
+/* global open, __ENV */
+import { check, sleep } from "k6";
+import { SharedArray } from "k6/data";
+import crypto from "k6/crypto";
+import exec from "k6/execution";
+import http from "k6/http";
+import { Counter, Rate } from "k6/metrics";
+
+/**
+ * Mixed steady-state traffic (Sprint 5, design §357).
+ *
+ * 20 VUs for 90 s. Each iteration browses the public event list
+ * (`GET /events`) and the seeded event (`GET /events/:id`), then — at most once
+ * every 5 s per VU — holds one seat and immediately releases it with
+ * `DELETE /holds/:id`.
+ *
+ * Pacing math (D33/HOLDS_RATE_LIMIT_PER_MINUTE=20, per user):
+ *   - The limiter counts POST /events/:id/holds per user in a fixed 60 s window.
+ *   - Each VU owns one distinct user and one distinct seat (VU 1 -> seat 0,
+ *     ... VU 20 -> seat 19), so holds never contend with another VU's seat.
+ *   - `lastHoldAt` enforces a hard 5 000 ms floor between one VU's hold
+ *     attempts: 60 s / 5 s = 12 holds/min/VU is the worst case the pacing
+ *     permits (request latency and the 1.5 s iteration sleep can only lower
+ *     it). That worst case is still below the 20/min limit, and the run
+ *     measured zero 429s.
+ *   - A 429 is therefore a pacing bug, not an expected outcome.
+ *
+ * The load API must run with the matching `MAX_SEATS_PER_HOLD` config (default
+ * 6, read from `__ENV.MAX_SEATS_PER_HOLD` below). This scenario holds ONE seat
+ * per pass, so it only requires the server cap to be at least that.
+ *
+ * Expected statuses: GETs 200, hold 201 (or 409 if a previous release failed),
+ * release 204. Every other status — including 429 and 422 — is counted by
+ * `mixed_unexpected_rate`, which must stay below 1 %. In addition
+ * `rate_limit_hits` must be exactly 0, so even a single 429 fails the run
+ * (the 1 % rate alone would hide a lone 429 among thousands of requests).
+ *
+ * P95 pinned from the Step 5 baseline: observed 22.17 ms across all mixed
+ * requests, so the ceiling is 50 ms (~2.3x) — tight enough to catch a browsing
+ * or hold-regression while leaving room for a sweeper tick.
+ *
+ * Run:
+ *   docker run --rm -v "${PWD}/load:/load" -i \
+ *     -e API_BASE_URL=http://host.docker.internal:4000 \
+ *     grafana/k6 run /load/mixed.js
+ *
+ * Use a freshly seeded event (no leftover holds from flash-sale) and re-seed
+ * within the 15-minute access-token TTL.
+ */
+
+const seed = JSON.parse(open("./users.json"));
+const users = new SharedArray("load-users", () => seed.users);
+
+const BASE_URL = (__ENV.API_BASE_URL || "http://localhost:4000").replace(/\/+$/, "");
+const HOLD_INTERVAL_MS = 5_000;
+// The chunk size must match the load API's MAX_SEATS_PER_HOLD config (default 6).
+// This scenario holds one seat per pass; the guard catches a server configured
+// below that (which would turn every hold into a 422).
+const MAX_SEATS_PER_HOLD = Number(__ENV.MAX_SEATS_PER_HOLD ?? "6");
+
+if (!Number.isInteger(MAX_SEATS_PER_HOLD) || MAX_SEATS_PER_HOLD < 1) {
+  throw new Error(`MAX_SEATS_PER_HOLD must be a positive integer, got ${__ENV.MAX_SEATS_PER_HOLD}`);
+}
+
+// Pinned from the Step 5 baseline: observed p95 22.17 ms over all requests.
+// 50 ms is ~2.3x the baseline.
+const P95_REQUEST_LATENCY_MS = 50;
+
+const mixedUnexpected = new Rate("mixed_unexpected_rate");
+const rateLimitHits = new Counter("rate_limit_hits");
+
+// Per-VU module scope: each k6 VU has its own JS runtime, so this is not shared.
+let lastHoldAt = 0;
+
+const EXPECTED_BROWSE_STATUSES = [200];
+const EXPECTED_HOLD_STATUSES = [201, 409];
+const EXPECTED_RELEASE_STATUSES = [204];
+
+export const options = {
+  scenarios: {
+    mixed: {
+      executor: "constant-vus",
+      vus: 20,
+      duration: "90s",
+      gracefulStop: "10s",
+    },
+  },
+  thresholds: {
+    mixed_unexpected_rate: ["rate<0.01"],
+    rate_limit_hits: ["count==0"],
+    http_req_duration: [`p(95)<${P95_REQUEST_LATENCY_MS}`],
+    checks: ["rate>0.99"],
+  },
+};
+
+function authHeaders(user) {
+  return { Authorization: `Bearer ${user.token}` };
+}
+
+function recordStatus(response, expectedStatuses, checkName) {
+  const expected = expectedStatuses.indexOf(response.status) !== -1;
+  mixedUnexpected.add(!expected);
+  check(response, { [checkName]: () => expected });
+
+  if (response.status === 429) {
+    rateLimitHits.add(1);
+  }
+
+  return expected;
+}
+
+export default function () {
+  const user = users[(exec.vu.idInTest - 1) % users.length];
+  // One dedicated seat per VU; 20 VUs < 50 seats, so active holds never overlap.
+  const seatId = seed.seats[(exec.vu.idInTest - 1) % seed.seats.length];
+
+  const list = http.get(`${BASE_URL}/events?limit=10`, {
+    tags: { name: "GET /events" },
+  });
+  recordStatus(list, EXPECTED_BROWSE_STATUSES, "GET /events is 200");
+
+  const detail = http.get(`${BASE_URL}/events/${seed.eventId}`, {
+    headers: authHeaders(user),
+    tags: { name: "GET /events/:id" },
+  });
+  recordStatus(detail, EXPECTED_BROWSE_STATUSES, "GET /events/:id is 200");
+
+  if (Date.now() - lastHoldAt >= HOLD_INTERVAL_MS) {
+    // Stamp before the request so a failed/slow attempt still consumes the slot.
+    lastHoldAt = Date.now();
+
+    const hold = http.post(
+      `${BASE_URL}/events/${seed.eventId}/holds`,
+      JSON.stringify({ seatIds: [seatId] }),
+      {
+        headers: {
+          Authorization: `Bearer ${user.token}`,
+          "Content-Type": "application/json",
+          "Idempotency-Key": uuidv4(),
+        },
+        tags: { name: "POST /events/:id/holds" },
+      },
+    );
+
+    if (recordStatus(hold, EXPECTED_HOLD_STATUSES, "hold is 201/409") && hold.status === 201) {
+      const holdId = hold.json("holdId");
+
+      if (typeof holdId === "string") {
+        const release = http.del(`${BASE_URL}/holds/${holdId}`, null, {
+          headers: authHeaders(user),
+          tags: { name: "DELETE /holds/:id" },
+        });
+        recordStatus(release, EXPECTED_RELEASE_STATUSES, "release is 204");
+      }
+    }
+  }
+
+  sleep(1.5);
+}
+
+/** RFC 4122 v4 from k6 crypto bytes (no dependency on a version-specific UUID API). */
+function uuidv4() {
+  const bytes = new Uint8Array(crypto.randomBytes(16));
+  bytes[6] = (bytes[6] & 0x0f) | 0x40;
+  bytes[8] = (bytes[8] & 0x3f) | 0x80;
+  const hex = Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join("");
+
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
+}
