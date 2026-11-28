@@ -1,7 +1,10 @@
 name: CI
 
 on:
+  # `main` is covered by deploy.yml, which runs this same gate as its own `ci`
+  # job before deploying. Keeping `main` here too would run the suite twice.
   push:
+    branches-ignore: [main]
   pull_request:
 
 jobs:
