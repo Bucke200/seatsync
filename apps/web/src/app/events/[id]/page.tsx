@@ -238,8 +238,11 @@ function messageFor(error: unknown): string {
  * verification — the API already owns that — it only compares the identity the
  * page was rendered with against the identity a refresh handed back. Tokens are
  * base64url-encoded JWT segments, so `atob` needs the URL alphabet mapped back
- * and the padding restored. Any malformed input yields `null` (unknown
- * identity), which the caller treats as "different" and never adopts silently.
+ * and the padding restored. `atob` yields latin1 bytes, so the payload goes
+ * through `TextDecoder` before `JSON.parse`; a non-ASCII `sub` must not decode
+ * to mojibake and misfire the identity guard. Any malformed input yields `null`
+ * (unknown identity), which the caller treats as "different" and never adopts
+ * silently.
  */
 function accessTokenSubject(token: string): string | null {
   const payload = token.split(".")[1];
@@ -251,7 +254,8 @@ function accessTokenSubject(token: string): string | null {
   try {
     const base64 = payload.replace(/-/g, "+").replace(/_/g, "/");
     const padded = base64.padEnd(Math.ceil(base64.length / 4) * 4, "=");
-    const parsed: unknown = JSON.parse(atob(padded));
+    const bytes = Uint8Array.from(atob(padded), (char) => char.charCodeAt(0));
+    const parsed: unknown = JSON.parse(new TextDecoder().decode(bytes));
 
     if (!isRecord(parsed)) {
       return null;
@@ -394,7 +398,9 @@ export default function EventDetailPage() {
    * the one case the protocol signals: the server answers
    * `{ type: "error", code: "UNAUTHORIZED" }` before closing 1008 on a bad or
    * expired token, and the NEXT attempt refreshes once. A null refresh keeps
-   * `requestJson`'s logout semantics: clear the stored token and stop.
+   * `requestJson`'s logout semantics: clear the stored token and stop. At most
+   * one attempt runs at a time; a close during an in-flight refresh schedules a
+   * single follow-up instead of running concurrently.
    *
    * Identity guard: the hook captures the `sub` of the token this page rendered
    * with. After a refresh, a different `sub` is never adopted silently: the tab
@@ -406,10 +412,9 @@ export default function EventDetailPage() {
    * Known limitation (Sprint 1 cookie design): tabs of DIFFERENT users share one
    * cookie jar, so a reconnect after a real access-token expiry can only
    * re-authenticate as the LAST login. The identity guard turns that silent
-   * switch into an explicit reload. This reads spec §331 ("on every reconnect,
-   * fetch a fresh access token ... then refetch GET /events/:id")
-   * conservatively: refresh happens when the server actually rejects the token,
-   * and identity changes are never silent.
+   * switch into an explicit reload. This is the shipped behavior spec §331 now
+   * describes: re-authenticate with the stored token, refresh only when the
+   * server rejects it, and never change identity silently.
    */
   useEffect(() => {
     const initialToken = getAccessToken();
@@ -421,6 +426,12 @@ export default function EventDetailPage() {
     /** The identity this page was rendered with; a refresh must match it. */
     const initialSub = accessTokenSubject(initialToken);
     /**
+     * Non-null alias: TypeScript does not keep the guard's narrowing inside the
+     * nested reconnect functions, and the reload-failure path restores this
+     * exact token.
+     */
+    const renderedToken = initialToken;
+    /**
      * A previous identity reload already re-rendered this tab. The page must
      * still connect with the stored token (a valid token clears the flag via
      * `subscribed`; an invalid one is the terminal case below).
@@ -430,6 +441,13 @@ export default function EventDetailPage() {
     let stopped = false;
     let socket: WebSocket | null = null;
     let reconnectTimer: number | null = null;
+    /**
+     * `reconnect()` can await `/auth/refresh`, so a close (or a second schedule)
+     * may arrive mid-attempt. This flag guarantees at most one attempt runs;
+     * `reconnectPending` remembers a close that must become a follow-up attempt.
+     */
+    let reconnectInFlight = false;
+    let reconnectPending = false;
     let attempt = 0;
     let connectionGeneration = 0;
     /**
@@ -647,6 +665,13 @@ export default function EventDetailPage() {
         return;
       }
 
+      if (reconnectInFlight) {
+        // A close landed while an attempt was awaiting a refresh. Never run two
+        // attempts at once: run exactly one follow-up after the current one.
+        reconnectPending = true;
+        return;
+      }
+
       const delay = Math.min(
         WS_RECONNECT_BASE_DELAY_MS * 2 ** Math.min(attempt, 4),
         WS_RECONNECT_MAX_DELAY_MS,
@@ -655,8 +680,33 @@ export default function EventDetailPage() {
       attempt += 1;
       reconnectTimer = window.setTimeout(() => {
         reconnectTimer = null;
-        void reconnect();
+        void runReconnect();
       }, delay);
+    }
+
+    async function runReconnect(): Promise<void> {
+      reconnectInFlight = true;
+
+      try {
+        await reconnect();
+      } catch (err) {
+        // A storage failure (or any unexpected throw) must surface as a warning
+        // rather than an unhandled rejection. The loop stops here; a reload can
+        // start it again.
+        console.warn("SeatSync live updates: reconnect attempt failed", err);
+      } finally {
+        reconnectInFlight = false;
+
+        // A follow-up only makes sense if the attempt left no live socket and
+        // did not deliberately stop the loop (terminal auth failure/reload).
+        if (reconnectPending) {
+          reconnectPending = false;
+
+          if (!stopped && socket === null) {
+            scheduleReconnect();
+          }
+        }
+      }
     }
 
     async function reconnect(): Promise<void> {
@@ -671,7 +721,9 @@ export default function EventDetailPage() {
         const storedToken = getAccessToken();
 
         if (storedToken === null) {
+          // No token anywhere: no later attempt can authenticate.
           console.warn("SeatSync live updates: no stored token; reconnect stopped");
+          stopped = true;
           return;
         }
 
@@ -694,6 +746,7 @@ export default function EventDetailPage() {
         // authenticate. Mirror `requestJson`'s 401 path and stop.
         clearAccessToken();
         console.warn("SeatSync live updates: session expired; reconnect stopped");
+        stopped = true;
         return;
       }
 
@@ -715,10 +768,37 @@ export default function EventDetailPage() {
           return;
         }
 
-        // The reloaded page reads this token from sessionStorage.
-        setAccessToken(token);
-        window.sessionStorage.setItem(IDENTITY_RELOAD_FLAG, "1");
-        window.location.reload();
+        // The reloaded page reads this token from sessionStorage. If storage or
+        // navigation is unavailable, do not adopt the foreign identity: log,
+        // restore the token this page was rendered with, clear the marker and
+        // stop the loop. A partial switch would leave the UI showing one user
+        // while REST calls act as another.
+        try {
+          setAccessToken(token);
+          window.sessionStorage.setItem(IDENTITY_RELOAD_FLAG, "1");
+          window.location.reload();
+        } catch (err) {
+          console.warn(
+            "SeatSync live updates: identity reload failed; reconnect stopped",
+            err,
+          );
+
+          try {
+            setAccessToken(renderedToken);
+          } catch {
+            // The page keeps whatever token is stored; it stops either way.
+          }
+
+          try {
+            // Leaving this marker behind would make a later page load stop
+            // instead of retrying the identity reload.
+            window.sessionStorage.removeItem(IDENTITY_RELOAD_FLAG);
+          } catch {
+            // Storage is what just failed; there is nothing else to clean up.
+          }
+
+          stopped = true;
+        }
         return;
       }
 

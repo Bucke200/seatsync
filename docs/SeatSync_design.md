@@ -328,7 +328,7 @@ A sprint can start only when every sprint it depends on is merged to `main`. Spr
 - [ ] WebSocket server at `/ws` using `ws`. The client's first message is `{ type: "auth", token }`; then `{ type: "subscribe", eventId }` joins that event's room.
 - [ ] `apps/api/src/realtime/publisher.ts`: listen to `seatEvents` and publish each change to the Redis channel `seats:{eventId}` as `{ eventId, seats: [{ id, status, version }] }`
 - [ ] `apps/api/src/realtime/subscriber.ts`: each API instance subscribes to `seats:*` and forwards messages to the sockets in that room
-- [ ] Client logic: keep a version per seat and ignore any message whose version is not newer. On every reconnect, fetch a fresh access token (a socket can outlive `ACCESS_TOKEN_TTL_SECONDS`), then refetch `GET /events/:id` as a snapshot
+- [ ] Client logic: keep a version per seat and ignore any message whose version is not newer. On reconnect, re-authenticate with the stored access token (a socket can outlive `ACCESS_TOKEN_TTL_SECONDS`); only a server rejection (`UNAUTHORIZED` before close 1008) fetches a fresh token via the refresh cookie, and a refreshed identity that differs from the page's triggers an explicit reload rather than a silent user switch. Then refetch `GET /events/:id` as a snapshot
 - [ ] Ping/pong heartbeat; terminate sockets that don't answer
 - [ ] If Redis is unavailable, log it, keep serving REST, and reconnect with backoff. The WebSocket layer must never block or fail a hold or booking.
 - [ ] `docker-compose.scale.yml`: 2 `api` replicas behind nginx, with WebSocket upgrade headers configured
