@@ -24,6 +24,10 @@ FROM base AS builder
 # only at runtime.
 ARG API_PROXY_TARGET=http://localhost:4000
 ENV API_PROXY_TARGET=$API_PROXY_TARGET
+# The browser WebSocket URL is inlined by Next at build time, so it must be a
+# build arg (not a runtime env var). Defaults to the dev-stack API.
+ARG NEXT_PUBLIC_WS_URL=
+ENV NEXT_PUBLIC_WS_URL=$NEXT_PUBLIC_WS_URL
 COPY --from=deps /app/node_modules ./node_modules
 COPY --from=deps /app/apps/web/node_modules ./apps/web/node_modules
 COPY --from=deps /app/packages/shared ./packages/shared

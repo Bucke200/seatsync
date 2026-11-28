@@ -141,6 +141,9 @@ services:
       args:
         # Next bakes the rewrite destination at build time (same as base).
         API_PROXY_TARGET: http://api:4000
+        # The browser WS URL is inlined at build time too; nginx is the only
+        # host-visible WS path, so pass ws://localhost:${NGINX_PORT}/ws.
+        NEXT_PUBLIC_WS_URL: ${NEXT_PUBLIC_WS_URL:-}
     environment:
       # Next's server-side /api/* proxy resolves `api` through Docker DNS, which
       # returns both replica addresses. The browser's WebSocket URL is different:
