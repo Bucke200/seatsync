@@ -4,6 +4,7 @@ import { createPool } from "./db/pool";
 import { startExpireHoldsJob } from "./jobs/expireHolds";
 import { startRetryRefundsJob } from "./jobs/retryRefunds";
 import { logger } from "./logger";
+import { createHoldsRateLimiter } from "./middleware/rateLimit";
 import { createPaymentProvider } from "./payments";
 import { startSeatEventPublisher } from "./realtime/publisher";
 import { createRedisClient } from "./realtime/redis";
@@ -25,7 +26,11 @@ function main(): void {
 
   const pool = createPool(config);
   const redis = createRedisClient(config);
-  const app = createApp({ pool, redis });
+  // D33: the holds limiter owns a dedicated Redis connection so it can never
+  // degrade `/health` or the pub/sub clients. It is created here, not inside
+  // `createApp`, so shutdown has a handle for it.
+  const holdsRateLimiter = createHoldsRateLimiter({ config, logger });
+  const app = createApp({ pool, redis, config, holdsRateLimiter });
   const sweeperTimer = startExpireHoldsJob(pool, config, logger);
   // D24: refund retries share the sweeper cadence (doc-unspecified interval,
   // recorded in the Sprint 3 report) and, like the sweeper, never run at boot
@@ -81,7 +86,9 @@ function main(): void {
     //    publisher first removes the sole `seatEvents` listener, so nothing new
     //    can be published, and stopping the subscriber next guarantees no
     //    Redis -> hub broadcast outlives the drain. The WS server is already
-    //    closed, so nothing can be written to a closed socket. Redis (health
+    //    closed, so nothing can be written to a closed socket. The holds
+    //    limiter's dedicated Redis connection is closed here too: the HTTP
+    //    drain is finished, so no request can be waiting on it. Redis (health
     //    client) and the pool go last.
     const realtimeClosed = realtime.close();
 
@@ -92,6 +99,7 @@ function main(): void {
         realtimeClosed,
         publisherStopped,
         subscriberStopped,
+        holdsRateLimiter.close(),
         pool.end(),
       ];
 

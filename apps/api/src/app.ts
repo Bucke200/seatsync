@@ -5,6 +5,7 @@ import type { Pool } from "pg";
 import swaggerUi from "swagger-ui-express";
 import { loadConfig, type Config } from "./config";
 import { errorHandler } from "./middleware/errors";
+import type { HoldsRateLimiter } from "./middleware/rateLimit";
 import { requestIdMiddleware } from "./middleware/requestId";
 import { generateOpenApiDocument } from "./openapi";
 import { createAuthRouter } from "./routes/auth";
@@ -19,6 +20,12 @@ export interface AppDependencies {
   redis: Redis;
   /** Defaults to `loadConfig(process.env)` so existing call sites keep working. */
   config?: Config;
+  /**
+   * D33 rate limiter. `server.ts` creates it so it can close the dedicated
+   * Redis connection during shutdown; tests may inject one to control its
+   * client. When omitted, the holds router creates its own.
+   */
+  holdsRateLimiter?: HoldsRateLimiter;
 }
 
 /**
@@ -29,6 +36,7 @@ export function createApp({
   pool,
   redis,
   config = loadConfig(process.env),
+  holdsRateLimiter,
 }: AppDependencies): Express {
   const app = express();
 
@@ -48,8 +56,13 @@ export function createApp({
   app.use("/health", createHealthRouter({ pool, redis }));
   app.use("/auth", createAuthRouter(pool, config));
   app.use("/events", createEventsRouter(pool, config));
-  // Two prefixes under one router (`/events/{id}/holds`, `/holds/{id}`).
-  app.use(createHoldsRouter(pool, config));
+  // Two prefixes under one router (`/events/{id}/holds`, `/holds/{id}`). The
+  // limiter is created per app and applied only to the POST path inside.
+  const holds = createHoldsRouter(pool, config, holdsRateLimiter);
+  app.use(holds.router);
+  // Expose the effective limiter (injected or created here) for tests and
+  // diagnostics; `server.ts` owns the production instance and closes it.
+  app.locals["holdsRateLimiter"] = holds.rateLimiter;
   // `/holds/{id}/checkout` (Step 3); booking reads join this router in Step 5.
   app.use(createBookingsRouter(pool, config));
 
