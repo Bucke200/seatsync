@@ -7,6 +7,7 @@
     "dev": "node -r dotenv/config --env-file-if-exists=../../.env --import tsx src/server.ts",
     "start": "node --env-file-if-exists=../../.env --import tsx src/server.ts",
     "migrate": "node --env-file-if-exists=../../.env node_modules/node-pg-migrate/bin/node-pg-migrate.js -m migrations -d DATABASE_URL",
+    "seed:load": "tsx src/scripts/seedLoad.ts",
     "lint": "eslint .",
     "typecheck": "tsc --noEmit",
     "test": "node --env-file-if-exists=../../.env node_modules/jest/bin/jest.js"
